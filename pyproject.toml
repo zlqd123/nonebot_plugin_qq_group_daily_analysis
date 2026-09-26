@@ -1,8 +1,8 @@
 [project]
-name = "nonebot-plugin-group-daily-report"
+name = "nonebot-plugin-qq-group-daily-analysis"
 version = "1.0.0"
 description = "群聊日报：统计分析 + 话题总结 + 海报图片，可顺带生成漫画并定时推送"
-readme = "README.md"
+readme = "nonebot_plugin_qq_group_daily_analysis/README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 keywords = ["nonebot", "nonebot2", "daily-report", "onebot11", "qq"]
@@ -25,7 +25,7 @@ Repository = "https://github.com/zlqd123/nonebot_plugin_qq_group_daily_analysis"
 adapters = [
     { name = "OneBot V11", module = "nonebot.adapters.onebot.v11" },
 ]
-plugin_dirs = []
+plugin_dirs = ["nonebot_plugin_qq_group_daily_analysis"]
 builtin_plugins = []
 
 [build-system]
@@ -33,10 +33,6 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-# 插件文件直接铺在仓库根上（nb-cli / nbpm 按分支检出后放进 plugins/ 即可用），
-# 但 wheel 必须落到同名包目录下 nonebot 才会认，否则会装成一堆散落的顶层模块。
-# 所以把根目录整体映射进包名，而不是用 packages= 指向子目录。
-# 只能留 force-include 一条：同时写 only-include 会把素材打进两遍，wheel 直接翻倍。
-# 主题模板和素材有 40MB，必须一起打包，否则装完渲染不出图。
-[tool.hatch.build.targets.wheel.force-include]
-"." = "nonebot_plugin_group_daily_report"
+# 标准布局：包就是一个与仓库同名的子目录，直接指向它。
+# 主题模板和素材有 40MB，会随包一起打进去——少了它们装完渲染不出图。
+packages = ["nonebot_plugin_qq_group_daily_analysis"]

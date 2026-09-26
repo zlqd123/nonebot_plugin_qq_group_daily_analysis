@@ -477,8 +477,8 @@ docker exec bison5-nonebot-1 apt-get install -y fonts-noto-cjk
 ## 结构
 
 ```
-nonebot_plugin_group_daily_report/
-├── __init__.py     插件入口：指令、定时注册、元数据
+nonebot_plugin_qq_group_daily_analysis/
+├── __init__.py     插件入口：三条指令、定时注册、元数据
 ├── config.py       配置定义
 ├── collect.py      消息采集与清洗（时间窗口回溯 + 只分析文字 + 昵称剥离）
 ├── stats.py        纯统计：活跃度、时段分布、贡献榜、昵称压缩
@@ -488,7 +488,7 @@ nonebot_plugin_group_daily_report/
 ├── report.py       渲染入口 + 纯文字降级 + 数据清洗
 ├── pipeline.py     主流程编排
 ├── templates/
-│   └── themes/     astrbot 原主题模板与素材（6 套，约 41MB）
+│   └── themes/     astrbot 原主题模板与素材（6 套，约 40MB）
 ├── tools/
 │   ├── sync_themes.py  从上游仓库同步模板与素材
 │   └── selfcheck.py    静态自检，不生图

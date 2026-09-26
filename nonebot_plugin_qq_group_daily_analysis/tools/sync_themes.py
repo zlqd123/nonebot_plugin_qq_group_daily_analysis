@@ -3,25 +3,51 @@
 原则是**原样搬运、不改模板**：ATRI 的 24MB 字体和 6.5MB 动图全部带上，
 这样渲染结果和上游一致，也不用去连 GitHub CDN。
 
-**运行前必须先有上游仓库的本地副本**（脚本本身不含它，也不会去自动下载）::
+脚本本身不含上游仓库，也不自动下载，需要先自己 clone 一份再指过来::
 
     git clone --depth 1 \\
-        https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis.git \\
-        D:/tool/deepseek/workspace2/astrbot_daily
-    python tools/sync_themes.py
+        https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis.git
+    python tools/sync_themes.py [上游仓库路径]
 
-路径写死在本机，迁移时改下面两个常量即可。脚本会**整体覆盖**
-``templates/themes/``，跑之前确认没有手工改动。
+不传路径时依次找 ``ASTRBOT_DAILY`` 环境变量和脚本旁边的 ``astrbot_daily/``。
+脚本会**整体覆盖** ``templates/themes/``，跑之前确认没有手工改动。
 """
 
 import shutil
 import sys
 from pathlib import Path
 
-SRC_ROOT = Path(r"D:\tool\deepseek\workspace2\astrbot_daily")
-TPL_SRC = SRC_ROOT / "src" / "infrastructure" / "reporting" / "templates"
-ASSET_SRC = SRC_ROOT / "assets"
-DST = Path(__file__).resolve().parent.parent / "templates" / "themes"
+# 插件根目录 = 本文件所在的 tools/ 的上一级，跟着仓库走而不是写死本机路径
+PKG_ROOT = Path(__file__).resolve().parent.parent
+DST = PKG_ROOT / "templates" / "themes"
+
+UPSTREAM_URL = "https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis.git"
+
+
+def _find_src_root() -> Path | None:
+    """定位上游仓库副本。
+
+    优先级：命令行参数 > ``ASTRBOT_DAILY`` 环境变量 > 脚本旁边的
+    ``astrbot_daily/``。都找不到时返回 ``None``。
+
+    Returns:
+        上游仓库路径；没找到时返回 ``None``。
+    """
+    import os
+
+    for cand in (
+        sys.argv[1] if len(sys.argv) > 1 else None,
+        os.environ.get("ASTRBOT_DAILY"),
+        str(PKG_ROOT.parent.parent / "astrbot_daily"),
+    ):
+        if cand and (Path(cand) / "src").is_dir():
+            return Path(cand)
+    return None
+
+
+SRC_ROOT = _find_src_root()
+TPL_SRC = SRC_ROOT / "src" / "infrastructure" / "reporting" / "templates" if SRC_ROOT else None
+ASSET_SRC = SRC_ROOT / "assets" if SRC_ROOT else None
 
 # 本插件配置里的主题名 -> 上游目录名。
 # 只保留上游 README 明确列出的 6 套：scrapbook / retro_futurism /
@@ -58,13 +84,13 @@ THEME_ASSETS = {"atri": ("ATRI", "file"), "miku": ("HatsuneMiku", "")}
 
 def main() -> None:
     """执行搬运。"""
-    if not TPL_SRC.is_dir():
+    if SRC_ROOT is None or not TPL_SRC.is_dir():
         print(
-            f"找不到上游模板目录：{TPL_SRC}\n"
-            f"请先 clone：\n"
-            f"  git clone --depth 1 "
-            f"https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis.git "
-            f"{SRC_ROOT}",
+            "找不到上游仓库副本。\n"
+            "请先 clone 一份再指过来：\n"
+            f"  git clone --depth 1 {UPSTREAM_URL}\n"
+            "  python tools/sync_themes.py <clone 出来的路径>\n"
+            "也可以设环境变量 ASTRBOT_DAILY 指向它。",
             file=sys.stderr,
         )
         raise SystemExit(1)

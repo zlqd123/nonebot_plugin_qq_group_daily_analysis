@@ -1,4 +1,9 @@
-"""不生图的静态自检：主题表、素材、入参映射是否都自洽。"""
+"""不生图的静态自检：主题表、素材、入参映射是否都自洽。
+
+不依赖 nonebot 运行时，也不需要配任何 key：
+
+    python tools/selfcheck.py
+"""
 
 import importlib.util
 import re
@@ -6,8 +11,10 @@ import sys
 import types as t
 from pathlib import Path
 
-PLUG = Path(r"D:\net\docker\bison5\app\plugins\nonebot_plugin_group_daily_report")
-PKG = "gdr_p"
+# 插件根目录 = 本文件所在的 tools/ 的上一级，跟着仓库走而不是写死本机路径
+PLUG = Path(__file__).resolve().parent.parent
+PKG = PLUG.name  # 用真实包名注册，模块间相对导入才成立
+sys.path.insert(0, str(PLUG.parent))
 
 pkg = t.ModuleType(PKG)
 pkg.__path__ = [str(PLUG)]
