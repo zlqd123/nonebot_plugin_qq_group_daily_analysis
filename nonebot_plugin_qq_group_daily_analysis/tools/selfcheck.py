@@ -5,6 +5,7 @@
     python tools/selfcheck.py
 """
 
+import asyncio
 import importlib.util
 import re
 import sys
@@ -174,6 +175,57 @@ qz = themes._quality({"title": "t", "subtitle": "s", "summary": "m",
 tot = sum(d["percentage"] for d in qz["dimensions"])
 print(f"  锐评  2 维 30%+30% -> 归一化 {tot:.1f}%，颜色={[d['color'] for d in qz['dimensions']]}")
 ok = ok and abs(tot - 100.0) < 0.01 and all(d.get("color") for d in qz["dimensions"])
+
+
+# 5. 子模板渲染出的素材路径必须是相对路径。
+#    这项防的是一个很隐蔽的坑：ATRI 的 quote_item / user_title_item 里写的是
+#    `{{ t2i_atri_font_mirror }}/file/x.gif`，而**渲染子模板时若没把这个变量传进去**，
+#    Jinja 会把未定义变量渲染成空串，拼出来就是 `/file/x.gif`——
+#    文件系统根目录的绝对路径，浏览器必然加载失败，而且不报错、静悄悄地裂图。
+async def check_asset_paths() -> bool:
+    """渲染各子模板，检查产出的素材路径可解析。
+
+    Returns:
+        全部为可解析路径时返回 ``True``。
+    """
+    quotes = [{"text": "想去一直没去", "user": "某人", "reason": "精准"}]
+    titles = [{"user": "某人", "title": "摸鱼王", "reason": "整天摸鱼"}]
+    quality = {"title": "t", "subtitle": "s", "summary": "m",
+               "dimensions": [{"name": "水群", "percentage": 100, "comment": "表情包"}]}
+
+    good = True
+    for style in themes.REPORT_STYLES:
+        env = themes._env(style)
+        conf = themes._THEMES[style]
+        frag_ctx = {
+            **themes._FONT_MIRRORS,
+            "t2i_font_source": themes._FONT_SOURCE,
+            **conf.get("extra", {}),
+        }
+        if local := conf.get("local_mirror"):
+            frag_ctx[local] = "."
+        for tpl, ctx in (
+            ("quote_item.html", {"quotes": themes._quotes(quotes)}),
+            ("user_title_item.html", {"titles": themes._titles(titles)}),
+            ("chat_quality_item.html", themes._quality(quality)),
+        ):
+            html = await themes._frag(env, tpl, **ctx, **frag_ctx)
+            found = re.findall(r'(?:src="([^"]+)"|url\([\'"]?([^\'")]+))', html)
+            paths = [a or b for a, b in found]
+            paths = [p for p in paths
+                     if "/file/" in p or any(e in p for e in (".png", ".gif", ".webp"))]
+            if not paths:
+                continue
+            # 远程 CDN 正常；本地素材必须是 ./ 开头的相对路径
+            bad = [p for p in paths if p.startswith("/") or "://" not in p and not p.startswith(".")]
+            good = good and not bad
+            print(f"  {'✓' if not bad else '✗'} [{style:<9}] {tpl:<22} "
+                  f"{len(paths)} 个引用  例: {paths[0]}")
+    return good
+
+
+print("\n=== 子模板素材路径（必须是相对路径）===")
+ok = asyncio.run(check_asset_paths()) and ok
 
 print("\n" + ("=== 全部通过 ===" if ok else "=== 存在失败 ==="))
 sys.exit(0 if ok else 1)
