@@ -1,0 +1,14 @@
+# 默认按文本处理，检出时统一 LF，避免各平台换行符互相污染
+* text=auto eol=lf
+
+# 二进制素材不做任何换行符转换，否则会损坏文件
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.woff2 binary
+*.ico binary
+
+# 主题模板保持原样，上游是什么就是什么
+templates/** -text

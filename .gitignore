@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# NoneBot
+.bot.pytest_cache/
+.pdm-python
+
+# 日报产物与本地数据
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# 密钥：配置一律走 .env，绝不能进仓库
+.env
+.env.*
+!.env.example
