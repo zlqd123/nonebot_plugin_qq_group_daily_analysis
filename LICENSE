@@ -1,0 +1,32 @@
+MIT License
+
+Copyright (c) 2025 Helian Nuits
+Copyright (c) 2026 zlqd123
+
+本仓库的 NoneBot 版本移植自 astrbot_plugin_qq_group_daily_analysis
+(https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis)，
+其原始版权归 Helian Nuits 所有，依据 MIT 许可沿用。
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+海报主题的模板与素材（templates/themes/）来自上游 astrbot 插件，遵循其原始许可。
+其中 ATRI 主题所用的 LXGW 文泉驿系列字体为 SIL Open Font License 1.1，
+可自由使用、修改与再分发。
