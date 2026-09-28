@@ -311,6 +311,9 @@ async def _push_one(bot: Bot, group_id: int) -> None:
             )
             return
         await send_segments(bot, group_id, segments)
+        # 定时推送与指令共用同一个收尾：发完都要报一句「请查收」。
+        # 海报渲染慢、也可能被 QQ 吞掉，没有这句用户会以为没收到而重复敲指令。
+        await bot.send_group_msg(group_id=group_id, message="群日报已发送，请查收")
         logger.info(
             f"[群日报] 已推送群 {group_id} 日报"
             f"（{stats.total_messages if stats else 0} 条消息，"

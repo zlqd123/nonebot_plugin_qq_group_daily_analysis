@@ -395,21 +395,40 @@ async def render_theme_image(
     directory = style
     env = _env(directory)
 
+    # 子模板同样可能引用 mirror 变量，**必须和主模板拿到同一份**。
+    # 漏传时 Jinja 把未定义变量渲染成空串，于是
+    # ``{{ t2i_atri_font_mirror }}/file/x.gif`` 变成 ``/file/x.gif``——
+    # 文件系统根目录的绝对路径，图片必然裂，而且不报错。
+    # ATRI 的 quote_item / user_title_item 正是这么写的。
+    frag_ctx: dict[str, Any] = {
+        **_FONT_MIRRORS,
+        "t2i_font_source": _FONT_SOURCE,
+        **conf.get("extra", {}),
+    }
+    if local := conf.get("local_mirror"):
+        frag_ctx[local] = "."
+
     chart = ""
     if any(stats.hourly):
         chart = await _frag(
-            env, "activity_chart.html", chart_data=_chart_data(stats.hourly)
+            env, "activity_chart.html", chart_data=_chart_data(stats.hourly), **frag_ctx
         )
 
     # 三个条目子模板都自带 {% for %}，所以整份列表交给它们渲染
-    topics_html = await _frag(env, "topic_item.html", topics=_topics(analysis.get("topics")))
-    quotes_html = await _frag(env, "quote_item.html", quotes=_quotes(analysis.get("quotes")))
-    titles_html = await _frag(env, "user_title_item.html", titles=_titles(analysis.get("titles")))
+    topics_html = await _frag(
+        env, "topic_item.html", topics=_topics(analysis.get("topics")), **frag_ctx
+    )
+    quotes_html = await _frag(
+        env, "quote_item.html", quotes=_quotes(analysis.get("quotes")), **frag_ctx
+    )
+    titles_html = await _frag(
+        env, "user_title_item.html", titles=_titles(analysis.get("titles")), **frag_ctx
+    )
 
     quality_html = ""
     qctx = _quality(analysis.get("quality"))
     if qctx:
-        quality_html = await _frag(env, "chat_quality_item.html", **qctx)
+        quality_html = await _frag(env, "chat_quality_item.html", **qctx, **frag_ctx)
 
     peak = stats.peak_hour
     ctx: dict[str, Any] = {
