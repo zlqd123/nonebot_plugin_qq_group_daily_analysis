@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
 from nonebot import get_bots, get_plugin_config, on_command, require
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
@@ -20,6 +21,7 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
 from .cleanup import cleanup_record_db
+from .collect import ChatArchive, fetch_group_archive, resolve_window
 from .config import Config
 from .imagegen import ImageModel
 from .llm import TextModel
@@ -289,13 +291,164 @@ def _tzinfo(name: str):
         return None
 
 
-async def _push_one(bot: Bot, group_id: int) -> None:
-    """向单个群生成并推送日报（海报 + 漫画）。
+def _prefetch_lead() -> int:
+    """提前采集的分钟数，负数按 0 处理。
+
+    Returns:
+        ``gdr_push_prefetch_minutes``，钳制到 [0, 55] 的整数。
+    """
+    try:
+        lead = int(config.gdr_push_prefetch_minutes)
+    except (TypeError, ValueError):
+        lead = 0
+    return max(0, min(lead, 55))
+
+
+def _int_list(field: str) -> set[int] | None:
+    """把 cron 的 hour/minute 字段解析成整数集合。
+
+    只认纯数字和逗号列表（``"14"`` / ``"14,22"``）。区间、通配、步长一律拒绝，
+    因为它们没法和「前移若干分钟」做可靠换算。
+
+    Args:
+        field: cron 字段值。
+
+    Returns:
+        整数集合；无法解析时返回 ``None``。
+    """
+    parts = field.split(",")
+    out: set[int] = set()
+    for p in parts:
+        if not p.isdigit():
+            return None
+        out.add(int(p))
+    return out or None
+
+
+def _shift_cron_back(fields: dict[str, str], lead: int) -> dict[str, str] | None:
+    """把 cron 的「时:分」整体前移 ``lead`` 分钟。
+
+    APScheduler 的 hour/minute 是**独立字段**，所以 ``0 14,22 * * *`` 前移 8 分钟
+    得到 ``52 13,21 * * *``，恰好是 13:52 与 21:52。
+
+    换算后必须能用新的 minute 集合 × hour 集合**精确还原**出所有时刻，否则宁可
+    放弃提前采集——把定时任务挪到错误的时间点比不挪更糟。典型放弃场景是
+    ``0 0 * * *``（午夜）：前移 8 分钟应是前一天 23:52，cron 表达不了。
+
+    Args:
+        fields: :func:`_parse_cron` 的结果。
+        lead: 提前分钟数。
+
+    Returns:
+        前移后的 cron 字段；无法安全前移时返回 ``None``。
+    """
+    if lead <= 0:
+        return None
+    minutes = _int_list(fields["minute"])
+    hours = _int_list(fields["hour"])
+    if not minutes or not hours:
+        return None
+
+    original = {(m, h) for m in minutes for h in hours}
+    shifted: set[tuple[int, int]] = set()
+    for m, h in original:
+        total = h * 60 + m - lead
+        if total < 0:
+            return None  # 跨到前一天，cron 表达不了
+        shifted.add((total % 60, total // 60))
+
+    new_minutes = {m for m, _ in shifted}
+    new_hours = {h for _, h in shifted}
+    # 还原校验：新字段的笛卡尔积必须和换算结果逐个相等
+    if {(m, h) for m in new_minutes for h in new_hours} != shifted:
+        return None
+
+    out = dict(fields)
+    out["minute"] = ",".join(str(m) for m in sorted(new_minutes))
+    out["hour"] = ",".join(str(h) for h in sorted(new_hours))
+    return out
+
+
+async def _prefetch_archive(bot: Bot, group_id: int) -> ChatArchive | None:
+    """定时推送的提前采集：只拉消息，不做任何分析。
+
+    用比手动指令更保守的间隔（``gdr_push_fetch_interval``），因为这一跑的目的
+    就是躲开 NapCat 的拥塞窗口。
 
     Args:
         bot: OneBot v11 机器人实例。
         group_id: 群号。
+
+    Returns:
+        采集结果；失败时返回 ``None``，调用方会退回现场采集。
     """
+    start_ts, _, _ = resolve_window(config.gdr_window)
+    try:
+        archive = await fetch_group_archive(
+            bot,
+            group_id,
+            history_lens=config.gdr_history_lens,
+            source=config.gdr_source,
+            page_size=config.gdr_fetch_page_size,
+            max_pages=config.gdr_fetch_max_pages,
+            interval=config.gdr_push_fetch_interval,
+            member_cache_ttl=config.gdr_member_cache_ttl,
+            self_id=bot.self_id,
+            since_ts=start_ts,
+        )
+    except Exception as e:
+        logger.warning(f"[群日报] 群 {group_id} 提前采集失败: {e!s}（到点后仍会再试一次）")
+        return None
+    logger.info(
+        f"[群日报] 群 {group_id} 提前采集完成：{len(archive.messages)} 条"
+        f"（间隔 {config.gdr_push_fetch_interval}s）"
+    )
+    return archive if archive.messages else None
+
+
+async def _wait_until(hour: int, minute: int, tz) -> None:
+    """等到今天的 ``hour:minute``；已经过了就直接返回。
+
+    Args:
+        hour: 目标小时（24 小时制）。
+        minute: 目标分钟。
+        tz: 时区；``None`` 表示用服务器本地时间。
+    """
+    now = datetime.now(tz)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    wait = (target - now).total_seconds()
+    if wait <= 0:
+        return
+    logger.info(f"[群日报] 已提前采集，等待 {wait / 60:.1f} 分钟到点发送")
+    await asyncio.sleep(wait)
+
+
+async def _push_one(
+    bot: Bot,
+    group_id: int,
+    *,
+    send_hour: int | None = None,
+    send_minute: int | None = None,
+    lead: int = 0,
+) -> None:
+    """向单个群生成并推送日报（海报 + 漫画）。
+
+    ``lead>0`` 时启用提前采集：先把聊天记录拉回来，等到 ``send_hour:send_minute``
+    再做分析和发送。采集是有风控的那一步，分析和生图不是，所以只提前采集。
+
+    Args:
+        bot: OneBot v11 机器人实例。
+        group_id: 群号。
+        send_hour: 实际发送时刻的小时；``None`` 表示不等待。
+        send_minute: 实际发送时刻的分钟。
+        lead: 提前采集的分钟数。
+    """
+    archive = None
+    if lead > 0:
+        archive = await _prefetch_archive(bot, group_id)
+        if send_hour is not None:
+            await _wait_until(send_hour, send_minute or 0, _tzinfo(config.gdr_timezone))
+
     try:
         segments, stats, _ = await generate_daily_report(
             bot,
@@ -304,6 +457,7 @@ async def _push_one(bot: Bot, group_id: int) -> None:
             text_model=text_model,
             image_model=image_model,
             with_comic=config.gdr_enable_comic,
+            archive=archive,
         )
         if not segments:
             await bot.send_group_msg(
@@ -323,11 +477,19 @@ async def _push_one(bot: Bot, group_id: int) -> None:
         logger.error(f"[群日报] 定时推送群 {group_id} 失败: {e!s}")
 
 
-def _make_pusher(group_ids: list[int]):
+def _make_pusher(
+    group_ids: list[int],
+    *,
+    lead: int = 0,
+    send_hours: list[tuple[int, int]] | None = None,
+):
     """构造一个推送指定若干群的协程。
 
     Args:
         group_ids: 目标群号列表。
+        lead: 提前采集的分钟数，0 表示到点才采集。
+        send_hours: 与 ``group_ids`` 一一对应的 ``(时, 分)``；
+            给了才会等待到点再发。
 
     Returns:
         可交给 APScheduler 的异步协程。
@@ -340,8 +502,12 @@ def _make_pusher(group_ids: list[int]):
         for bot in get_bots().values():
             if not isinstance(bot, Bot):
                 continue
-            for gid in group_ids:
-                await _push_one(bot, gid)
+            # send_hours 与 group_ids 一一对应，用下标对齐而不是跟 bot 循环对齐
+            for i, gid in enumerate(group_ids):
+                hh = mm = None
+                if send_hours is not None and i < len(send_hours):
+                    hh, mm = send_hours[i]
+                await _push_one(bot, gid, send_hour=hh, send_minute=mm, lead=lead)
                 # 群之间留间隔，连续调 API 容易触发 NapCat 限流
                 await asyncio.sleep(3)
 
@@ -349,41 +515,86 @@ def _make_pusher(group_ids: list[int]):
 
 
 def _register_schedules() -> None:
-    """按配置注册定时任务：每群独立时刻优先，其次是全局 cron。"""
+    """按配置注册定时任务：每群独立时刻优先，其次是全局 cron。
+
+    启用提前采集时，**任务本身注册在「发送时刻 − 提前量」**，任务内部再等到
+    发送时刻才发。这样群里看到的发送时间没有变化，只是聊天记录提前拉了。
+    """
     tz = _tzinfo(config.gdr_timezone)
+    lead = _prefetch_lead()
 
     for item in config.gdr_group_schedules:
         if not item.enable:
             continue
         hour, minute = (int(x) for x in item.time.split(":"))
+        job_hour, job_minute = hour, minute
+        if lead:
+            total = hour * 60 + minute - lead
+            if total < 0:
+                logger.warning(
+                    f"[群日报] 群 {item.group_id} 的 {item.time} 减去 {lead} 分钟会跨到前一天，"
+                    f"cron 表达不了，本次不提前采集"
+                )
+                lead_for_this = 0
+            else:
+                job_hour, job_minute = total // 60, total % 60
+                lead_for_this = lead
+        else:
+            lead_for_this = 0
+
         scheduler.add_job(
-            _make_pusher([item.group_id]),
+            _make_pusher([item.group_id], lead=lead_for_this, send_hours=[(hour, minute)]),
             "cron",
-            hour=hour,
-            minute=minute,
+            hour=job_hour,
+            minute=job_minute,
             id=f"group_daily_report_{item.group_id}",
             replace_existing=True,
             misfire_grace_time=1800,
             timezone=tz,
         )
-        logger.info(
-            f"[群日报] 已注册群 {item.group_id} 定时推送："
-            f"每天 {item.time}（{config.gdr_timezone}）"
-        )
+        if lead_for_this:
+            logger.info(
+                f"[群日报] 已注册群 {item.group_id} 定时推送："
+                f"每天 {job_hour:02d}:{job_minute:02d} 开始采集"
+                f"（间隔 {config.gdr_push_fetch_interval}s），"
+                f"{item.time} 发送（{config.gdr_timezone}）"
+            )
+        else:
+            logger.info(
+                f"[群日报] 已注册群 {item.group_id} 定时推送："
+                f"每天 {item.time}（{config.gdr_timezone}）"
+            )
 
     # 独立时刻优先；没配才用全局 cron + 群列表，两者可共存
     if config.gdr_group_list and config.gdr_push_cron:
+        fields = _parse_cron(config.gdr_push_cron)
+        shifted = _shift_cron_back(fields, lead) if lead else None
+        if lead and shifted is None:
+            logger.warning(
+                f"[群日报] 全局 cron「{config.gdr_push_cron}」无法安全前移 "
+                f"{lead} 分钟，本次不提前采集"
+            )
+            lead_for_cron = 0
+        else:
+            lead_for_cron = lead if shifted else 0
+
         scheduler.add_job(
-            _make_pusher(config.gdr_group_list),
+            _make_pusher(config.gdr_group_list, lead=lead_for_cron),
             "cron",
-            **_parse_cron(config.gdr_push_cron),
+            **(shifted or fields),
             id="group_daily_report_push",
             replace_existing=True,
             misfire_grace_time=1800,
             timezone=tz,
         )
+        when = (
+            f"{shifted['hour']}:{shifted['minute']}（提前 {lead} 分钟采集，原 "
+            f"{config.gdr_push_cron}）"
+            if shifted
+            else config.gdr_push_cron
+        )
         logger.info(
-            f"[群日报] 已注册全局定时推送：{config.gdr_push_cron} "
+            f"[群日报] 已注册全局定时推送：{when} "
             f"→ 群 {config.gdr_group_list}（{config.gdr_timezone}）"
         )
 

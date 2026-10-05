@@ -206,6 +206,22 @@ class Config(BaseModel, extra=Extra.ignore):
             "「群日报漫画」「群日报整体」是手动指令，不受这个开关影响"
         ),
     )
+    gdr_push_prefetch_minutes: int = Field(
+        default=8,
+        description=(
+            "定时推送提前多少分钟开始采集聊天记录，0=不提前（发送时刻才采集）。"
+            "get_group_msg_history 有 NapCat 风控：撞上拥塞时会整页卡死到超时，"
+            "最终一条都拿不到。提前采集可以避开拥塞点；"
+            "只对定时推送生效，手动指令保持原样"
+        ),
+    )
+    gdr_push_fetch_interval: float = Field(
+        default=15.0,
+        description=(
+            "定时推送采集时的翻页间隔秒数，比手动指令的 gdr_fetch_interval 更保守。"
+            "只在 gdr_push_prefetch_minutes>0 时生效"
+        ),
+    )
 
     gdr_report_mode: Literal["image", "text", "both"] = Field(
         default="both", description="日报输出方式：image=只发图，text=只发文字，both=都发"

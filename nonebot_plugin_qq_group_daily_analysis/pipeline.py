@@ -80,6 +80,7 @@ async def generate_daily_report(
     with_comic: bool = False,
     comic_only: bool = False,
     notify_missing_comic: bool = False,
+    archive: ChatArchive | None = None,
 ) -> tuple[list[dict[str, Any]], ChatStats | None, ChatArchive | None]:
     """生成一份群日报的**消息段**（本函数不负责发送）。
 
@@ -99,6 +100,9 @@ async def generate_daily_report(
         notify_missing_comic: 没配生图模型、漫画出不来时，是否在群里提示。
             定时推送传 ``False``：那个点没人在看，报缺 key 纯属噪音，
             日志里已经记了。只有用户主动敲漫画指令时才值得告诉他为什么没图。
+        archive: **已经采集好的**消息。给了就跳过采集直接进入分析，
+            用于定时推送提前若干分钟把消息先拉回来、到点再出图。
+            ``None``（默认）表示照常现场采集。
 
     Returns:
         ``(消息段列表, 统计结果, 采集结果)``；无可用内容时消息段为空。
@@ -107,18 +111,24 @@ async def generate_daily_report(
     start_ts, end_ts, window_label = resolve_window(config.gdr_window)
     notices: list[str] = []
 
-    archive = await fetch_group_archive(
-        bot,
-        group_id,
-        history_lens=config.gdr_history_lens,
-        source=config.gdr_source,
-        page_size=config.gdr_fetch_page_size,
-        max_pages=config.gdr_fetch_max_pages,
-        interval=config.gdr_fetch_interval,
-        member_cache_ttl=config.gdr_member_cache_ttl,
-        self_id=bot.self_id,
-        since_ts=start_ts,
-    )
+    if archive is None:
+        archive = await fetch_group_archive(
+            bot,
+            group_id,
+            history_lens=config.gdr_history_lens,
+            source=config.gdr_source,
+            page_size=config.gdr_fetch_page_size,
+            max_pages=config.gdr_fetch_max_pages,
+            interval=config.gdr_fetch_interval,
+            member_cache_ttl=config.gdr_member_cache_ttl,
+            self_id=bot.self_id,
+            since_ts=start_ts,
+        )
+    else:
+        logger.info(
+            f"[群日报] 群 {group_id} 使用提前采集的结果"
+            f"（{len(archive.messages)} 条），不再重复调用 OneBot API"
+        )
     if not archive.messages:
         logger.warning(f"[群日报] 群 {group_id} 未采集到消息")
         return [], None, archive
