@@ -35,6 +35,12 @@ async def _stub(**_kw):
 
 
 _hr.template_to_pic = _stub
+# themes.py 从子模导入 get_new_page（分段渲染用）。selfcheck 不渲染，
+# 但导入必须成立，否则 load("themes") 会 ModuleNotFoundError。
+_browser_mod = t.ModuleType("nonebot_plugin_htmlrender.browser")
+_browser_mod.get_new_page = _stub
+_hr.browser = _browser_mod
+sys.modules["nonebot_plugin_htmlrender.browser"] = _browser_mod
 sys.modules["nonebot_plugin_htmlrender"] = _hr
 import nonebot  # noqa: E402
 

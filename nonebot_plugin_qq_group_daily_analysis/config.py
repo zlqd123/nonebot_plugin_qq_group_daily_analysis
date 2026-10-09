@@ -183,6 +183,14 @@ class Config(BaseModel, extra=Extra.ignore):
     # ── 输出 ──────────────────────────────────────────────
     gdr_report_width: int = Field(default=900, description="日报海报渲染宽度（像素）")
     gdr_enable_text_summary: bool = Field(default=True, description="同时推送纯文字总结（合并转发）")
+    gdr_split_report: bool = Field(
+        default=False,
+        description=(
+            "是否把过长的海报切成上下两段发送。切点固定在「高亮记忆碎片」"
+            "结束之后、「神人名片颁发」之前——避开浏览器整页截图在页面"
+            "过高时底部出现空白的问题；话题为空时自动退回整图"
+        ),
+    )
 
     # ── 定时 ──────────────────────────────────────────────
     gdr_timezone: str = Field(

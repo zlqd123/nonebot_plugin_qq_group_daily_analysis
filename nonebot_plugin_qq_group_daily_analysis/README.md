@@ -421,6 +421,7 @@ gdr_report_width=900
 | `gdr_report_style` | `scrapbook` | 6 套主题之一，见「海报主题」 |
 | `gdr_report_mode` | `both` | `image` / `text` / `both` |
 | `gdr_enable_text_summary` | `true` | 是否生成纯文字总结 |
+| `gdr_split_report` | `false` | 海报过长时分两段发送，切点在「高亮记忆碎片」之后、「神人名片颁发」之前；话题为空时自动退回整图 |
 | `gdr_prompt_style` | `roast` | 4 种语气之一 |
 | `gdr_prompt_override` | 空 | 自定义提示词 |
 

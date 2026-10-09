@@ -19,6 +19,7 @@ from .themes import (
     clean_titles,
     clean_topics,
     render_theme_image,
+    render_theme_image_split,
 )
 
 if TYPE_CHECKING:
@@ -28,6 +29,7 @@ __all__ = [
     "REPORT_STYLES",
     "build_text_summary",
     "render_report_image",
+    "render_report_image_split",
     "to_image_segment",
 ]
 
@@ -69,6 +71,35 @@ async def render_report_image(
         PNG 图片字节；渲染失败时返回 ``None``。
     """
     return await render_theme_image(
+        archive, stats, analysis, style=_safe_style(style), width=width
+    )
+
+
+async def render_report_image_split(
+    archive: ChatArchive,
+    stats: ChatStats,
+    analysis: dict[str, Any],
+    *,
+    width: int = 900,
+    style: str = "scrapbook",
+) -> list[bytes] | None:
+    """把日报渲染成上下两段海报。
+
+    切点固定在「高亮记忆碎片」结束之后、「神人名片颁发」之前，
+    详见 :func:`themes.render_theme_image_split`。
+
+    Args:
+        archive: 消息采集结果。
+        stats: 统计结果。
+        analysis: 文字模型返回的结构化分析。
+        width: 渲染宽度（像素）。
+        style: 海报风格，见 :data:`REPORT_STYLES`。
+
+    Returns:
+        ``[上半图, 下半图]``；不适合分段或渲染失败时返回 ``None``，
+        调用方应退回整图。
+    """
+    return await render_theme_image_split(
         archive, stats, analysis, style=_safe_style(style), width=width
     )
 

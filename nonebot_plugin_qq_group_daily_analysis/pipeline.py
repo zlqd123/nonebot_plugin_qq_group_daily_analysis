@@ -13,7 +13,12 @@ from nonebot.log import logger
 from .collect import fetch_group_archive, resolve_window
 from .imagegen import ImageModel
 from .llm import build_analysis_prompt, build_comic_prompt_prompt
-from .report import build_text_summary, render_report_image, to_image_segment
+from .report import (
+    build_text_summary,
+    render_report_image,
+    render_report_image_split,
+    to_image_segment,
+)
 from .stats import analyze, compress_nicknames, restore_nicknames
 
 if TYPE_CHECKING:
@@ -222,15 +227,32 @@ async def generate_daily_report(
 
     # 「群日报漫画」只要漫画：跳过海报渲染，省掉一次 HTML 截图
     if config.gdr_report_mode in ("image", "both") and not comic_only:
-        image = await render_report_image(
-            archive,
-            stats,
-            analysis,
-            width=config.gdr_report_width,
-            style=config.gdr_report_style,
-        )
-        if image:
-            segments.append(to_image_segment(image))
+        images: list[bytes] = []
+        if config.gdr_split_report:
+            parts = await render_report_image_split(
+                archive,
+                stats,
+                analysis,
+                width=config.gdr_report_width,
+                style=config.gdr_report_style,
+            )
+            if parts:
+                images = parts
+            else:
+                # 无话题或分隔点后没有内容时退回整图
+                logger.info("[群日报] 分段不可用，退回整图")
+        if not images:
+            image = await render_report_image(
+                archive,
+                stats,
+                analysis,
+                width=config.gdr_report_width,
+                style=config.gdr_report_style,
+            )
+            if image:
+                images = [image]
+        if images:
+            segments.extend(to_image_segment(img) for img in images)
         else:
             # 静默降级会让人误以为「插件只输出文字」，所以明确告诉用户
             logger.warning("[群日报] 海报渲染失败，降级为纯文字")

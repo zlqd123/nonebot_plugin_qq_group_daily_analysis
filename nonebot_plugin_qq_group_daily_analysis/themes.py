@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 require("nonebot_plugin_htmlrender")
 from nonebot_plugin_htmlrender import template_to_pic  # noqa: E402
+from nonebot_plugin_htmlrender.browser import get_new_page  # noqa: E402
 
 THEME_DIR = Path(__file__).parent / "templates" / "themes"
 
@@ -367,25 +368,26 @@ def _quality(quality: Any) -> dict[str, Any]:
     }
 
 
-async def render_theme_image(
+async def _build_theme_context(
+    style: str,
     archive: ChatArchive,
     stats: ChatStats,
     analysis: dict[str, Any],
-    *,
-    style: str = "scrapbook",
-    width: int = 900,
-) -> bytes | None:
-    """用上游模板渲染指定主题的海报。
+) -> tuple[dict[str, Any], str] | None:
+    """组装上游模板渲染需要的全部入参。
+
+    6 套主题的入参高度统一（16 个共享变量 + 各主题自己的 mirror），
+    所以整份上下文只在这里构建一次，:func:`render_theme_image` 和
+    :func:`render_theme_image_split` 共用。
 
     Args:
+        style: 主题名，见 :data:`REPORT_STYLES`。
         archive: 消息采集结果。
         stats: 统计结果。
         analysis: 文字模型返回的结构化分析。
-        style: 主题名，见 :data:`REPORT_STYLES`。
-        width: 渲染宽度（像素）。
 
     Returns:
-        PNG 图片字节；主题未知或渲染失败时返回 ``None``。
+        ``(模板入参, 主题目录名)``；主题未知时返回 ``None``。
     """
     conf = _THEMES.get(style)
     if conf is None:
@@ -456,6 +458,33 @@ async def render_theme_image(
     if local := conf.get("local_mirror"):
         # 指向模板目录自身：素材从本地磁盘读，路径形如 ./file/xxx
         ctx[local] = "."
+    return ctx, directory
+
+
+async def render_theme_image(
+    archive: ChatArchive,
+    stats: ChatStats,
+    analysis: dict[str, Any],
+    *,
+    style: str = "scrapbook",
+    width: int = 900,
+) -> bytes | None:
+    """用上游模板渲染指定主题的海报。
+
+    Args:
+        archive: 消息采集结果。
+        stats: 统计结果。
+        analysis: 文字模型返回的结构化分析。
+        style: 主题名，见 :data:`REPORT_STYLES`。
+        width: 渲染宽度（像素）。
+
+    Returns:
+        PNG 图片字节；主题未知或渲染失败时返回 ``None``。
+    """
+    built = await _build_theme_context(style, archive, stats, analysis)
+    if built is None:
+        return None
+    ctx, directory = built
 
     try:
         return await template_to_pic(
@@ -467,4 +496,135 @@ async def render_theme_image(
         )
     except Exception as e:
         logger.error(f"[群日报] {style} 主题渲染失败: {e!s}")
+        return None
+
+
+#: 分段渲染时插在「话题」片段末尾的标记。分隔点固定在这里——
+#: 即「高亮记忆碎片」结束之后、「神人名片颁发」之前。
+_SPLIT_MARKER_ID = "gdr-split-marker"
+
+_SPLIT_SCRIPT = """
+(mode) => {
+  const m = document.getElementById('gdr-split-marker');
+  if (!m) return 'no-marker';
+  const hide = (el) => { el.style.display = 'none'; };
+  const forward = mode === 'after';
+  // 把标记之后（或之前）的内容逐层收集起来：
+  // 先收标记的同级，再收父级的同级，直到根。这样文档序里
+  // 标记一侧的全部内容都被隐藏，另一侧原样保留。
+  const list = [];
+  let node = m;
+  while (node && node !== document.documentElement) {
+    let sib = forward ? node.nextElementSibling : node.previousElementSibling;
+    while (sib) {
+      list.push(sib);
+      sib = forward ? sib.nextElementSibling : sib.previousElementSibling;
+    }
+    node = node.parentElement;
+  }
+  list.forEach(hide);
+  hide(m);
+  if (!forward) {
+    // 前半段隐藏后，标记所在的区块往往只剩题头——话题区的
+    // 「高亮记忆碎片」标题属于上半图，下半图应从「神人名片颁发」
+    // 开始。判定：容器内没有「标记之后」的可见内容，就连题头
+    // 一起藏掉；还能看到标记之后的内容，说明容器装着下半图，保留。
+    let p = m.parentElement;
+    while (p && p !== document.body) {
+      const hasAfter = Array.from(p.querySelectorAll('*')).some(
+        (c) =>
+          c !== m &&
+          c.style.display !== 'none' &&
+          (m.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING)
+      );
+      if (hasAfter) break;
+      hide(p);
+      p = p.parentElement;
+    }
+  }
+  return 'ok';
+}
+"""
+
+
+async def render_theme_image_split(
+    archive: ChatArchive,
+    stats: ChatStats,
+    analysis: dict[str, Any],
+    *,
+    style: str = "scrapbook",
+    width: int = 900,
+) -> list[bytes] | None:
+    """渲染海报并切成上下两段。
+
+    切点固定在「高亮记忆碎片」结束之后、「神人名片颁发」之前。
+    做法是在话题片段末尾注入一个零高标记，渲染后用 JS 分别隐藏
+    标记前后的 DOM，再各截一张整页图——不改上游模板，6 套主题
+    通用。整页截图在页面过高时底部会出现空白，分段正是为了
+    绕开浏览器的高度上限。
+
+    Args:
+        archive: 消息采集结果。
+        stats: 统计结果。
+        analysis: 文字模型返回的结构化分析。
+        style: 主题名，见 :data:`REPORT_STYLES`。
+        width: 渲染宽度（像素）。
+
+    Returns:
+        ``[上半图, 下半图]``；话题为空、其后没有有效内容、或渲染
+        失败时返回 ``None``，调用方应退回整图。
+    """
+    built = await _build_theme_context(style, archive, stats, analysis)
+    if built is None:
+        return None
+    ctx, directory = built
+
+    topics_html = str(ctx.get("topics_html") or "")
+    if not topics_html.strip():
+        logger.info("[群日报] 没有话题内容，无需分段")
+        return None
+    # 分隔点之后若无任何有效内容（名片/金句/锐评全空），下半图
+    # 只剩页脚，发出去没有意义，直接退回整图。
+    if not any(
+        str(ctx.get(k) or "").strip()
+        for k in ("titles_html", "quotes_html", "chat_quality_html")
+    ):
+        logger.info("[群日报] 分隔点之后没有内容，无需分段")
+        return None
+    ctx["topics_html"] = (
+        topics_html
+        + f'<div id="{_SPLIT_MARKER_ID}" style="height:0;overflow:hidden"></div>'
+    )
+
+    # 先渲染成 HTML 字符串（template_to_pic 内部也是这么做的），
+    # 之后完全接管页面：先 goto 模板目录建立相对路径基准，
+    # 再 set_content——与 html_to_pic 的流程一致。
+    html = await _env(directory).get_template("image_template.html").render_async(
+        **ctx
+    )
+    base_url = f"file://{THEME_DIR / directory}"
+
+    try:
+        async with get_new_page(
+            2, viewport={"width": width, "height": 10}
+        ) as page:
+            page.on(
+                "console", lambda msg: logger.debug(f"浏览器控制台: {msg.text}")
+            )
+            await page.goto(base_url)
+            # 上半图：隐藏标记之后的内容
+            await page.set_content(html, wait_until="networkidle")
+            await page.evaluate(_SPLIT_SCRIPT, "after")
+            top = await page.screenshot(
+                full_page=True, type="png", timeout=30_000
+            )
+            # 下半图：重置页面后隐藏标记之前的内容
+            await page.set_content(html, wait_until="networkidle")
+            await page.evaluate(_SPLIT_SCRIPT, "before")
+            bottom = await page.screenshot(
+                full_page=True, type="png", timeout=30_000
+            )
+        return [top, bottom]
+    except Exception as e:
+        logger.error(f"[群日报] {style} 主题分段渲染失败: {e!s}")
         return None
