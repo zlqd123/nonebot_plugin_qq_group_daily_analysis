@@ -5,6 +5,25 @@
 配置全部走 bison 的 `.env`（`gdr_` 前缀），**没有 HTTP 配置页**。
 文字总结模型与生图模型**完全独立**，各自配 base_url / key / model。
 
+> **本次重新适配（对齐上游 astrbot 版 v5.8.4）**
+>
+> 保留：采集（NapCat 风控规避、时间驱动翻页）、昵称代号压缩、海报一图分二。
+> 其余按上游最新版重新适配，重点变化：
+>
+> - **漫画链路整体重写**：分镜提示词改为「每话题一格 + 气泡中文台词 +
+>   底部字幕条 + Background Context」的结构化 `scene` 输出，多层解析 +
+>   失败重试；文字模型输出先剥离 `<think>` 思考块（详见「生图模型」章节）。
+> - **生图客户端多协议化**（`gdr_image_provider`）：doubao / images /
+>   google / chat / grok；修复旧版 url 形式响应在已关闭的 httpx client
+>   上下载必失败的 bug；图片字节做签名校验，拒绝把错误页当图片发群里。
+> - **Gemini 文字模型修复**：system 走 `systemInstruction`（旧版连续两个
+>   user 轮次会被 400 拒绝，默认配置完全不可用）。
+> - **死配置激活/移除**：`gdr_max_tokens`、`gdr_enable_quotes`、
+>   `gdr_enable_quality`、`gdr_enable_report` 现在真实生效；
+>   `gdr_text_thinking` 移除（其 `extra_body` 实现是无效的 SDK 约定字段）。
+> - **落库清理修复**：VACUUM 改走 AUTOCOMMIT 连接（旧版在事务内必报错）；
+>   不再删除共享 uninfo 表的 Session/User 孤儿行。
+
 ---
 
 ## 指令
@@ -183,8 +202,33 @@ gdr_prompt_override="用粤语写，多用网络梗"
 生图**按次计费且偏慢**，所以有两道保护：同群防重入（上一条没跑完时直接拒绝）
 和全局并发上限 2。标题为空的话题会在调生图之前被滤掉，不白花钱。
 
-漫画提示词由文字模型从 `summary` + `topics` 现场生成（4 格分镜、人设跨格一致），
-风格串可用 `gdr_comic_prompt` 覆盖。
+### 漫画链路（按上游 astrbot 版 v5.8.4 重新适配）
+
+旧版的漫画提示词是「让文字模型自由发挥一段英文四格描述」，拿到什么发什么，
+既不校验也不过滤思考内容，是漫画内容完全跑偏的根源。现在按上游移植：
+
+1. **每个话题强制一格**——分析出的 N 个话题对应 Panel 1..N，不许模型自行裁减；
+2. **气泡中文台词 + 底部字幕条**——台词 ≤15 字、字幕条 ≤30 字，显式指定
+   渲染中文原文，画面与群聊内容一眼可对上；
+3. **话题详情作为 Background Context** 附在每格提示词里（帮生图模型理解剧情，
+   同时严禁渲染成正文长文）；
+4. **结构化输出**——文字模型必须返回 `{"scene": "..."}`，插件做多层解析
+   （JSON 对象 → 正则 → 数组整合），失败自动重试一次，不会把模型闲聊
+   原样丢给生图 API；
+5. 文字模型输出先**剥离 `<think>` 思考块**（推理模型经中转时常见污染），
+   Gemini 响应跳过 `thought: true` 的思考 parts。
+
+诊断口令：日志里搜 `漫画分镜 scene`，能看到最终发给生图 API 的提示词前 300 字。
+
+### 生图协议（gdr_image_provider）
+
+| 值 | 说明 |
+| :--- | :--- |
+| `doubao` | 火山方舟 Seedream（默认） |
+| `images` | OpenAI 兼容 `/images/generations`（gpt-image-1 等） |
+| `google` | Gemini `generateContent` 原生接口（nano-banana 等，跳过思考图片） |
+| `chat` | OpenAI 兼容 `/chat/completions` 多模态生图 |
+| `grok` | x.ai `/images/generations` |
 
 ### 火山方舟 Seedream（默认）
 
@@ -194,9 +238,14 @@ gdr_image_api_keys=["ark-xxx"]
 ```
 
 默认值：`https://ark.cn-beijing.volces.com/api/v3/images/generations`、
-`doubao-seedream-5-0-flash-260915`、`2048x2048`。
+`doubao-seedream-5-0-flash-260915`、`2048x1152`（16:9 横版，适合漫画条）。
 
-`base_url` 写到 `/v1` 或写完整的 `.../images/generations` **都认**，后者不会被重复拼接。
+`base_url` 写裸域名、写到 `/v1` 或写完整的 `.../images/generations` **都认**，
+不会被重复拼接。
+
+`gdr_image_optimize_prompt` 控制 Seedream 的服务端提示词改写：留空走服务端
+默认；`off` 显式关闭——**漫画内容跑偏时优先试这个**，让分镜提示词原样生效；
+`fast` / `standard` 显式选择优化档位。
 
 ### size 的两种写法（互斥，别混用）
 
@@ -215,7 +264,7 @@ gdr_image_api_keys=["ark-xxx"]
 - 宽高比 ∈ `[1/16, 16]`
 
 ```env
-gdr_image_size=2048x2048   # 有效：4194304 像素，比例 1
+gdr_image_size=2048x1152   # 有效：16:9 横版，2359296 像素
 gdr_image_size=512x512     # 无效：262144 像素，低于下限
 ```
 
@@ -224,6 +273,7 @@ gdr_image_size=512x512     # 无效：262144 像素，低于下限
 OpenAI 原生封顶 1536/1792，**没有 2048x2048**，必须开 upscale：
 
 ```env
+gdr_image_provider="images"
 gdr_image_base_url="https://api.openai.com/v1"
 gdr_image_model="gpt-image-1"
 gdr_image_size=2048x2048
@@ -234,6 +284,16 @@ gdr_image_quality=high
 `upscale` 先按 `gdr_image_native_sizes` 里**宽高比最接近**的规格请求，再用 Pillow
 放大到目标尺寸。按宽高比匹配是关键——只按面积匹配的话 `2048x2048` 会落到
 `1792x1024`（横版 1.75:1），再拉成正方形就是严重变形。
+
+### 换 Gemini（google 协议）
+
+```env
+gdr_image_provider="google"
+gdr_image_base_url="https://generativelanguage.googleapis.com/v1beta"
+gdr_image_model="gemini-2.5-flash-image"
+gdr_image_aspect_ratio="16:9"
+gdr_image_size="2K"        # 自动映射到 imageConfig 的 1K/2K/4K
+```
 
 ### quality 与分辨率无关
 
@@ -249,6 +309,9 @@ gdr_image_quality=high
 | `gdr_image_output_format` | 空 | `png` / `jpeg`，空则由服务商决定 |
 | `gdr_image_watermark` | 未设置 | 是否加水印；未设置则不发送该字段 |
 | `gdr_image_extra` | `{}` | 追加原始请求字段，如 `{"stream": false}`，会覆盖同名字段 |
+| `gdr_image_retries` | `1` | 生图失败后的重试次数（网络/内容异常均计） |
+| `gdr_image_retry_delay` | `2.0` | 生图重试间隔秒数 |
+| `gdr_image_aspect_ratio` | `16:9` | 宽高比（google / chat 协议使用） |
 | `gdr_image_timeout` | `300` | 超时（秒） |
 | `gdr_image_proxy` | 空 | 形如 `http://ip:port` |
 
@@ -385,22 +448,22 @@ gdr_report_width=900
 | `gdr_text_model` | `gemini-flash-latest` | 模型名 |
 | `gdr_text_proxy` | 空 | 代理 |
 | `gdr_text_timeout` | `300` | 超时（秒） |
-| `gdr_text_thinking` | 未设置 | 未设置不传 / `true` 开 / `false` 显式关 |
-| `gdr_max_tokens` | `5000` | 输出上限 |
+| `gdr_max_tokens` | `0` | 输出上限，`0`=不发送该字段由服务端决定（推荐；推理类中转把思考 token 计入该额度，设小会把长 JSON 截断） |
 | `gdr_max_topics` | `12` | 最多话题数 |
 | `gdr_max_quotes` | `8` | 最多金句数 |
-| `gdr_enable_quotes` | `true` | 是否提取金句 |
+| `gdr_enable_quotes` | `true` | 是否提取金句（关闭后提示词里不再要求该字段） |
 | `gdr_max_titles` | `5` | 最多起几个称号 |
-| `gdr_enable_quality` | `true` | 是否评估群聊锐评 |
+| `gdr_enable_quality` | `true` | 是否评估群聊锐评（关闭后提示词里不再要求该字段） |
 
 ### 生图模型
 
 | 变量 | 默认 | 说明 |
 | :--- | :--- | :--- |
-| `gdr_image_base_url` | 火山方舟地址 | 写到 `/v1` 或完整路径都认 |
+| `gdr_image_provider` | `doubao` | 协议：`doubao` / `images` / `google` / `chat` / `grok` |
+| `gdr_image_base_url` | 火山方舟地址 | 写裸域名、`/v1` 或完整路径都认 |
 | `gdr_image_api_keys` | `[]` | 留空则不生成漫画 |
 | `gdr_image_model` | `doubao-seedream-5-0-flash-260915` | 模型名 |
-| `gdr_image_size` | `2048x2048` | 档位 `1K`/`1.5K`/`2K` 或 `宽x高` |
+| `gdr_image_size` | `2048x1152` | 档位 `1K`/`1.5K`/`2K` 或 `宽x高` |
 | `gdr_image_size_mode` | `native` | `native` 原样透传 / `upscale` 降级请求后本地放大 |
 | `gdr_image_native_sizes` | OpenAI 那组 | upscale 模式可选的原生规格，逗号分隔 |
 | `gdr_image_quality` | 空 | OpenAI 独有档位，与分辨率无关 |

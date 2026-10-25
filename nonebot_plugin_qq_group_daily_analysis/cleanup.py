@@ -1,14 +1,20 @@
 """chatrecorder 落库的定期清理。
 
 ``nonebot-plugin-chatrecorder`` 本身没有任何保留策略，消息表会无限增长。
-本模块在低峰期定期清理，**只删 chatrecorder 自己的表**，
-绝不触碰 nonebot-bison 共用同一个 ``db.sqlite3`` 里的业务表。
+本模块在低峰期定期清理，**只删 chatrecorder 自己的消息表**。
 
 清理策略（两者都可用，都为 0 时关闭）：
 
 1. 按保留天数删除：``gdr_retention_days``
 2. 按库体积删除：``gdr_db_max_mb``，超限就从最旧开始删
 3. 删除后执行 ``VACUUM`` 真正归还磁盘（SQLite 删行不会自动缩小文件）
+
+与旧版的差异（对齐模块自己「绝不触碰其他插件数据」的承诺）：
+
+- **不再清理 uninfo 的 Session/User 孤儿行**——那张表是多个插件共享的，
+  「没有消息记录」不代表别的插件不需要那些行，旧版的孤儿清理越界了；
+- ``VACUUM`` 改用 AUTOCOMMIT 连接执行——SQLite 的 VACUUM 不能在事务内
+  运行，旧版走 ORM 会话执行必然报 "cannot VACUUM from within a transaction"。
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ def find_db_file() -> Path | None:
     Returns:
         数据库文件路径；orm 未启用、配置了外部数据库、或文件不存在时返回 ``None``。
     """
-    # 包「装了就可导入」，但没启用时不会建表，没必要做清理
+    # 包「装了就可导入」，但没启用时不会建表，没有必要做清理
     try:
         from nonebot import get_plugin
 
@@ -59,7 +65,9 @@ def find_db_file() -> Path | None:
 def db_size_mb(path: Path) -> float:
     """返回数据库大小（MB），含 wal / shm 附属文件。"""
     total = sum(
-        f.stat().st_size for f in (Path(f"{path}{s}") for s in ("", "-wal", "-shm")) if f.exists()
+        f.stat().st_size
+        for f in (Path(f"{path}{s}") for s in ("", "-wal", "-shm"))
+        if f.exists()
     )
     return total / 1024 / 1024
 
@@ -78,15 +86,14 @@ async def cleanup_record_db(
         batch: 每批删除条数，避免长事务锁库。
 
     Returns:
-        共删除的消息条数；orm/chatrecorder 未启用或出错时返回 0。
+        共删除的消息数；orm/chatrecorder 未启用或出错时返回 0。
     """
     # 这些库都在插件启用后才可用，必须惰性导入，否则本插件会加载失败
     try:
-        from sqlalchemy import delete, func, not_, select, text
+        from sqlalchemy import delete, select
 
         from nonebot_plugin_chatrecorder.model import MessageRecord
         from nonebot_plugin_orm import get_session
-        from nonebot_plugin_uninfo.orm import SessionModel, UserModel
     except ImportError as e:
         logger.debug(f"[群日报] 落库清理不可用（未启用 chatrecorder/orm）: {e!s}")
         return 0
@@ -95,25 +102,31 @@ async def cleanup_record_db(
     if path is None:
         return 0
 
-    ctx = _Ctx(delete, func, not_, select, text, MessageRecord, SessionModel, UserModel)
     before = db_size_mb(path)
     total_deleted = 0
     try:
+        engine = None
         async with get_session() as db:
+            engine = db.get_bind()
             if retention_days > 0:
                 cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
                     days=retention_days
                 )
-                total_deleted += await _delete_before(ctx, db, cutoff, batch)
+                total_deleted += await _delete_before(
+                    MessageRecord, delete, select, db, cutoff, batch
+                )
 
             if max_mb > 0 and db_size_mb(path) > max_mb:
-                total_deleted += await _shrink_to(ctx, db, path, max_mb, batch)
+                total_deleted += await _shrink_to(
+                    MessageRecord, delete, select, db, path, max_mb, batch
+                )
 
-            if total_deleted:
-                await _purge_orphans(ctx, db)
-                # SQLite 删行不会缩小文件，必须 VACUUM 才真正归还磁盘
-                await db.execute(text("VACUUM"))
-                await db.commit()
+        if total_deleted and engine is not None:
+            # SQLite 删行不会缩小文件，必须 VACUUM 才真正归还磁盘；
+            # VACUUM 不能在事务里跑，用 AUTOCOMMIT 连接单独执行。
+            async with engine.connect() as conn:
+                conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+                await conn.exec_driver_sql("VACUUM")
     except Exception as e:
         logger.error(f"[群日报] 清理落库失败: {e!s}")
         return 0
@@ -129,40 +142,17 @@ async def cleanup_record_db(
     return total_deleted
 
 
-class _Ctx:
-    """把惰性导入的符号打成一包，省得层层传参。"""
-
-    __slots__ = (
-        "MessageRecord",
-        "SessionModel",
-        "UserModel",
-        "delete",
-        "func",
-        "not_",
-        "select",
-        "text",
-    )
-
-    def __init__(self, delete, func, not_, select, text, MessageRecord, SessionModel, UserModel) -> None:
-        self.delete = delete
-        self.func = func
-        self.not_ = not_
-        self.select = select
-        self.text = text
-        self.MessageRecord = MessageRecord
-        self.SessionModel = SessionModel
-        self.UserModel = UserModel
-
-
-async def _delete_before(ctx: _Ctx, db, cutoff: datetime, batch: int) -> int:
+async def _delete_before(
+    MessageRecord, delete, select, db, cutoff: datetime, batch: int
+) -> int:
     """分批删除 ``time`` 早于 ``cutoff`` 的消息。"""
     total = 0
     while total < _MAX_DELETE_PER_RUN:
         ids = (
             (
                 await db.execute(
-                    ctx.select(ctx.MessageRecord.id)
-                    .where(ctx.MessageRecord.time < cutoff)
+                    select(MessageRecord.id)
+                    .where(MessageRecord.time < cutoff)
                     .limit(batch)
                 )
             )
@@ -171,7 +161,7 @@ async def _delete_before(ctx: _Ctx, db, cutoff: datetime, batch: int) -> int:
         )
         if not ids:
             break
-        await db.execute(ctx.delete(ctx.MessageRecord).where(ctx.MessageRecord.id.in_(ids)))
+        await db.execute(delete(MessageRecord).where(MessageRecord.id.in_(ids)))
         await db.commit()
         total += len(ids)
         if len(ids) < batch:
@@ -181,7 +171,9 @@ async def _delete_before(ctx: _Ctx, db, cutoff: datetime, batch: int) -> int:
     return total
 
 
-async def _shrink_to(ctx: _Ctx, db, path: Path, max_mb: int, batch: int) -> int:
+async def _shrink_to(
+    MessageRecord, delete, select, db, path: Path, max_mb: int, batch: int
+) -> int:
     """库体积超限时，从最旧的消息开始删，直到降到阈值的 90%。"""
     total = 0
     target = max_mb * 0.9
@@ -189,8 +181,8 @@ async def _shrink_to(ctx: _Ctx, db, path: Path, max_mb: int, batch: int) -> int:
         ids = (
             (
                 await db.execute(
-                    ctx.select(ctx.MessageRecord.id)
-                    .order_by(ctx.MessageRecord.id.asc())
+                    select(MessageRecord.id)
+                    .order_by(MessageRecord.id.asc())
                     .limit(batch)
                 )
             )
@@ -200,31 +192,9 @@ async def _shrink_to(ctx: _Ctx, db, path: Path, max_mb: int, batch: int) -> int:
         if not ids:
             logger.warning("[群日报] 消息表已空但库体积仍超限，可能存在其他大表")
             break
-        await db.execute(ctx.delete(ctx.MessageRecord).where(ctx.MessageRecord.id.in_(ids)))
+        await db.execute(delete(MessageRecord).where(MessageRecord.id.in_(ids)))
         await db.commit()
         total += len(ids)
     if total >= _MAX_DELETE_PER_RUN:
         logger.warning("[群日报] 按体积清理达到单次上限，剩余部分留到下次")
     return total
-
-
-async def _purge_orphans(ctx: _Ctx, db) -> None:
-    """删除不再被任何消息引用的 uninfo 会话与用户记录。"""
-    kept_sessions = ctx.select(ctx.func.distinct(ctx.MessageRecord.session_persist_id))
-    res = await db.execute(
-        ctx.delete(ctx.SessionModel).where(
-            ctx.not_(ctx.SessionModel.id.in_(kept_sessions))
-        )
-    )
-    sessions = res.rowcount or 0
-    await db.commit()
-
-    kept_users = ctx.select(ctx.func.distinct(ctx.SessionModel.user_persist_id))
-    res = await db.execute(
-        ctx.delete(ctx.UserModel).where(ctx.not_(ctx.UserModel.id.in_(kept_users)))
-    )
-    users = res.rowcount or 0
-    await db.commit()
-
-    if sessions or users:
-        logger.info(f"[群日报] 清理孤儿会话 {sessions} 条、孤儿用户 {users} 条")

@@ -22,8 +22,8 @@ from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
 from .cleanup import cleanup_record_db
 from .collect import ChatArchive, fetch_group_archive, resolve_window
+from .comicgen import ComicImageModel
 from .config import Config
-from .imagegen import ImageModel
 from .llm import TextModel
 from .pipeline import generate_daily_report
 
@@ -45,7 +45,7 @@ __plugin_meta__ = PluginMetadata(
 
 config = get_plugin_config(Config)
 text_model = TextModel(config)
-image_model = ImageModel(config)
+image_model = ComicImageModel(config)
 
 if not text_model.available:
     logger.warning("[群日报] 未配置 gdr_text_api_keys，插件将无法生成日报")
@@ -457,6 +457,9 @@ async def _push_one(
             text_model=text_model,
             image_model=image_model,
             with_comic=config.gdr_enable_comic,
+            # gdr_enable_report=false：定时推送不出海报（文字/漫画照常），
+            # 手动指令不受影响
+            poster=config.gdr_enable_report,
             archive=archive,
         )
         if not segments:

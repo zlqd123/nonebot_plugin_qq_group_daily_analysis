@@ -96,10 +96,14 @@ class Config(BaseModel, extra=Extra.ignore):
     gdr_text_model: str = Field(default="gemini-flash-latest", description="文字总结模型名")
     gdr_text_proxy: str = Field(default="", description="文字模型代理，形如 http://ip:port")
     gdr_text_timeout: int = Field(default=300, description="文字模型请求超时（秒）")
-    gdr_text_thinking: Optional[bool] = Field(
-        default=None, description="思考模式：None=不传，True=开，False=显式关闭"
+    gdr_max_tokens: int = Field(
+        default=0,
+        description=(
+            "输出上限（OpenAI 传 max_tokens，Gemini 传 maxOutputTokens）。"
+            "0=不发送该字段，由服务端决定（默认，推荐）——推理类模型经中转时"
+            "思考 token 也计入该额度，设小了会把 JSON 截断成解析失败"
+        ),
     )
-    gdr_max_tokens: int = Field(default=5000, description="总结输出的最大字数")
     gdr_max_topics: int = Field(default=12, description="最多归纳的话题数")
     gdr_max_quotes: int = Field(default=8, description="最多提取的金句数")
     gdr_enable_quotes: bool = Field(default=True, description="是否提取群聊金句")
@@ -114,8 +118,18 @@ class Config(BaseModel, extra=Extra.ignore):
     gdr_enable_quality: bool = Field(default=True, description="是否评估群聊质量")
 
     # ── 生图模型（漫画）───────────────────────────────────
-    # 默认值按火山方舟 Seedream 填。换 OpenAI 需同时改 base_url、model 和 size
-    # （OpenAI 用具体像素如 1024x1024，没有 "2K" 这种档位）
+    # 默认按火山方舟 Seedream 配（provider=doubao）。换服务商时改
+    # gdr_image_provider 并按 README 对应章节调整 base_url / model / size。
+    gdr_image_provider: Literal[
+        "doubao", "images", "google", "chat", "grok"
+    ] = Field(
+        default="doubao",
+        description=(
+            "生图接口协议：doubao=火山方舟 Seedream（默认）/ images=OpenAI 兼容 "
+            "images/generations / google=Gemini generateContent 原生接口 / "
+            "chat=OpenAI 兼容 chat/completions 多模态生图 / grok=x.ai"
+        ),
+    )
     gdr_image_base_url: str = Field(
         default="https://ark.cn-beijing.volces.com/api/v3/images/generations",
         description=(
@@ -143,11 +157,12 @@ class Config(BaseModel, extra=Extra.ignore):
         ),
     )
     gdr_image_size: str = Field(
-        default="2048x2048",
+        default="2048x1152",
         description=(
-            "出图尺寸，**原样透传给接口**。两种写法互斥，别混用："
+            "出图尺寸，**原样透传给接口**。默认 2048x1152（16:9 横版），"
+            "适合横向多格漫画条。两种写法互斥，别混用："
             "① 档位 1K / 1.5K / 2K（Seedream 默认 2K，1.5K 与 1K 同价但效果更好）；"
-            "② 宽x高 2048x2048，总像素须在 [921600, 4624220] 且宽高比在 [1/16, 16] 内。"
+            "② 宽x高 2048x1152，总像素须在 [921600, 4624220] 且宽高比在 [1/16, 16] 内。"
             "换 OpenAI 只能用 ②，且只认 1024x1024 / 1024x1536 / 1536x1024 这几个值"
         ),
     )
@@ -178,7 +193,35 @@ class Config(BaseModel, extra=Extra.ignore):
             "用于适配官方文档里有、但本插件还没做成配置项的参数"
         ),
     )
-    gdr_comic_prompt: str = Field(default="", description="漫画画面风格提示词，留空使用内置默认值")
+    gdr_comic_prompt: str = Field(
+        default="",
+        description=(
+            "漫画画面风格提示词（如「日式漫画风格，干净线稿」），"
+            "作为风格后缀追加在上游分镜规范之后；留空不追加"
+        ),
+    )
+    gdr_image_aspect_ratio: str = Field(
+        default="16:9",
+        description=(
+            "漫画宽高比（如 16:9 / 4:3 / 1:1 / 9:16）。"
+            "目前 google 与 chat 协议使用；images/doubao 用 gdr_image_size 控制比例"
+        ),
+    )
+    gdr_image_optimize_prompt: Literal["", "off", "fast", "standard"] = Field(
+        default="",
+        description=(
+            "Seedream 服务端提示词优化：留空=服务端默认；off=显式关闭"
+            "（漫画内容跑偏时可尝试关闭，让分镜提示词原样生效）；"
+            "fast/standard=显式选择优化档位"
+        ),
+    )
+    gdr_image_retries: int = Field(
+        default=1,
+        description="生图失败后的重试次数（网络/内容异常均计），0=不重试",
+    )
+    gdr_image_retry_delay: float = Field(
+        default=2.0, description="生图重试间隔秒数"
+    )
 
     # ── 输出 ──────────────────────────────────────────────
     gdr_report_width: int = Field(default=900, description="日报海报渲染宽度（像素）")

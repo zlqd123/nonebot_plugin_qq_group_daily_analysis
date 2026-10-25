@@ -11,8 +11,13 @@ from typing import TYPE_CHECKING, Any
 from nonebot.log import logger
 
 from .collect import fetch_group_archive, resolve_window
-from .imagegen import ImageModel
-from .llm import build_analysis_prompt, build_comic_prompt_prompt
+from .comicgen import ComicImageModel
+from .llm import (
+    TextModel,
+    build_analysis_prompt,
+    build_storyboard_prompt,
+    extract_scene,
+)
 from .report import (
     build_text_summary,
     render_report_image,
@@ -26,26 +31,32 @@ if TYPE_CHECKING:
 
     from .collect import ChatArchive
     from .config import Config
-    from .llm import TextModel
     from .stats import ChatStats
+
+#: 分镜提示词解析失败后的重试次数（独立于生图 API 自身的重试）
+_STORYBOARD_RETRIES = 1
 
 
 async def _run_comic(
-    model: ImageModel,
+    model: ComicImageModel,
     analysis: dict[str, Any],
     config: Config,
     text_model: TextModel,
 ) -> bytes | None:
     """生成漫画图片（单独包一层便于限流与异常隔离）。
 
-    只依赖 ``analysis`` 里的 summary 和 topics，因此海报和漫画可以共用**同一次**
-    文字模型分析——「群日报整体」不会为了多出这张图再调一次文字模型。
+    链路按上游 v5.8.4 移植：**每个话题强制一格**的分镜提示词（气泡中文台词
+    + 底部字幕条 + Background Context）→ 结构化解析出 ``scene``（解析失败
+    自动重试，绝不让模型的自由文本直接进生图 API）→ 多协议生图客户端出图。
+
+    只依赖 ``analysis`` 里的 topics，因此海报和漫画可以共用**同一次**文字模型
+    分析——「群日报整体」不会为了多出这张图把整段聊天记录再喂一遍。
 
     Args:
         model: 生图模型客户端。
         analysis: 已完成的分析结果。
         config: 插件配置。
-        text_model: 文字模型客户端，用来把话题翻成绘图提示词。
+        text_model: 文字模型客户端，用来产出分镜 scene 提示词。
 
     Returns:
         图片字节；跳过或失败时返回 ``None``。
@@ -60,16 +71,31 @@ async def _run_comic(
         if not topics:
             logger.info("[群日报] 无有效话题，跳过漫画")
             return None
-        prompt = await text_model.complete(
-            build_comic_prompt_prompt(
-                str(analysis.get("summary") or ""), topics, config
-            ),
-            "请直接输出英文绘图提示词。",
-        )
-        if not prompt.strip():
+
+        system, user = build_storyboard_prompt(topics, config)
+        scene: str | None = None
+        for attempt in range(_STORYBOARD_RETRIES + 1):
+            raw = await text_model.complete(system, user)
+            scene = extract_scene(raw)
+            if scene and scene.strip():
+                break
+            logger.warning(
+                f"[群日报] 漫画分镜解析失败（第 {attempt + 1} 次），"
+                f"原始输出前 200 字: {raw[:200]}"
+            )
+            scene = None
+            if attempt < _STORYBOARD_RETRIES:
+                user = (
+                    f"{user}\n\n【重要】上一次输出无法解析出 scene 字段。"
+                    "请严格按 JSON 格式重新输出，scene 里必须内联全部 "
+                    f"{len(topics)} 个 Panel 的完整描述。"
+                )
+        if not scene or not scene.strip():
+            logger.error("[群日报] 漫画分镜多次解析失败，放弃生图")
             return None
-        logger.info(f"[群日报] 漫画提示词: {prompt[:200]}")
-        return await model.generate(prompt)
+
+        logger.info(f"[群日报] 漫画分镜 scene（前 300 字）: {scene[:300]}")
+        return await model.generate(scene)
     except Exception as e:
         logger.error(f"[群日报] 漫画生成失败: {e!s}")
         return None
@@ -81,10 +107,11 @@ async def generate_daily_report(
     config: Config,
     *,
     text_model: TextModel,
-    image_model: ImageModel,
+    image_model: ComicImageModel,
     with_comic: bool = False,
     comic_only: bool = False,
     notify_missing_comic: bool = False,
+    poster: bool = True,
     archive: ChatArchive | None = None,
 ) -> tuple[list[dict[str, Any]], ChatStats | None, ChatArchive | None]:
     """生成一份群日报的**消息段**（本函数不负责发送）。
@@ -105,6 +132,8 @@ async def generate_daily_report(
         notify_missing_comic: 没配生图模型、漫画出不来时，是否在群里提示。
             定时推送传 ``False``：那个点没人在看，报缺 key 纯属噪音，
             日志里已经记了。只有用户主动敲漫画指令时才值得告诉他为什么没图。
+        poster: 是否渲染海报。定时推送配合 ``gdr_enable_report=false``
+            传 ``False``（只发文字/漫画）；手动指令恒为 ``True``。
         archive: **已经采集好的**消息。给了就跳过采集直接进入分析，
             用于定时推送提前若干分钟把消息先拉回来、到点再出图。
             ``None``（默认）表示照常现场采集。
@@ -225,8 +254,9 @@ async def generate_daily_report(
 
     segments: list[dict[str, Any]] = []
 
-    # 「群日报漫画」只要漫画：跳过海报渲染，省掉一次 HTML 截图
-    if config.gdr_report_mode in ("image", "both") and not comic_only:
+    # 「群日报漫画」只要漫画：跳过海报渲染，省掉一次 HTML 截图；
+    # 定时推送可用 gdr_enable_report=false 关掉海报（poster=False）
+    if poster and config.gdr_report_mode in ("image", "both") and not comic_only:
         images: list[bytes] = []
         if config.gdr_split_report:
             parts = await render_report_image_split(
