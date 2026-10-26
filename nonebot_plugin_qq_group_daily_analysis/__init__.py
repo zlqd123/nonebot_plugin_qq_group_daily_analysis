@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from typing import Any
 
 from nonebot import get_bots, get_plugin_config, on_command, require
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
@@ -208,8 +209,14 @@ async def handle_full(bot: Bot, event: GroupMessageEvent) -> None:
     )
 
 
-async def send_segments(bot: Bot, group_id: int, segments: list[dict]) -> None:
+async def send_segments(bot: Bot, group_id: int, segments: list[Any]) -> None:
     """逐条发送日报内容。
+
+    段结构：图片段来自 :func:`report.to_image_segment` 的
+    ``MessageSegment``（OneBot 的 ``message=[seg]`` 只认消息段对象，
+    裸 dict 会抛 ``ValueError: Unexpected type``），文字/告警段仍是
+    ``{"type": "text", ...}`` 字典。``MessageSegment`` 实现了 Mapping 接口，
+    下面的 ``s.get(...)`` 对两类都成立。
 
     **不要用合并转发**：NapCat 在 forward 节点里发 base64 图片时经常失败，
     群里只会显示「该消息类型暂不支持查看」。图片单独发一条。

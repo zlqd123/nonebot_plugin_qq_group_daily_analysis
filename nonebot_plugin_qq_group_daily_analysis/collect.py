@@ -373,7 +373,12 @@ def _chatrecorder_loaded() -> bool:
     try:
         from nonebot import get_plugin
 
-        return get_plugin("chatrecorder") is not None
+        # chatrecorder 的插件 id 是完整包名；旧版本可能注册为短名，
+        # 两个都查，避免把「装了没启用」误判成「已启用」。
+        return any(
+            get_plugin(pid) is not None
+            for pid in ("nonebot_plugin_chatrecorder", "chatrecorder")
+        )
     except Exception:
         return False
 
@@ -584,6 +589,8 @@ async def _collect_from_api(
 
     oldest_collected = min((m.timestamp for m in collected.values()), default=0)
     if since_ts and oldest_collected > since_ts:
+        # truncated 只由「时间窗口没覆盖到」决定；翻页/条数上限只截短
+        # 采集量，覆盖没到点才叫 truncated。
         truncated = True
         covered = (last_newest_time - oldest_collected) / 3600
         logger.warning(
@@ -593,11 +600,12 @@ async def _collect_from_api(
             f"可调大 gdr_fetch_page_size；连续快速调用该接口会触发 NapCat 限流，"
             f"反而拿到更少的数据"
         )
-    elif pages >= max_pages and len(collected) < history_lens:
-        truncated = True
-        logger.warning(
-            f"[群日报] 群 {group_id} 已达翻页上限 {max_pages}，"
-            f"仅取到 {len(collected)}/{history_lens} 条"
+    elif not since_ts and pages >= max_pages:
+        # 没有 since_ts（不限时间目标）时页数上限就是唯一的停止条件，
+        # 只记录信息级日志；truncated 上面已按「时间没覆盖到」判过。
+        logger.info(
+            f"[群日报] 群 {group_id} 已达采集上限（{len(collected)} 条 / "
+            f"{max_pages} 页）"
         )
     return collected, truncated, dropped
 

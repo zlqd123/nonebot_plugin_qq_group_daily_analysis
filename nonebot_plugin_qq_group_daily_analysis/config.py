@@ -223,6 +223,33 @@ class Config(BaseModel, extra=Extra.ignore):
         default=2.0, description="生图重试间隔秒数"
     )
 
+    # ── 敏感内容防护（生图链路）───────────────────────────
+    # 豆包等生图服务对提示词里的敏感内容直接 400
+    # （InputTextSensitiveContentDetected），既浪费配额又不出图。
+    # 防护三层：分镜提示词规则要求模型脱敏自检 → 本地词库二次筛查
+    # → 命中后交给文字模型改写，仍命中则降级去掉 Background Context。
+    gdr_sensitive_filter: bool = Field(
+        default=True,
+        description=(
+            "生图提示词本地敏感词筛查开关。开启后命中词库的提示词会先交给"
+            "文字模型脱敏改写，改不掉就降级为无背景上下文的精简分镜"
+        ),
+    )
+    gdr_sensitive_lexicon: str = Field(
+        default="",
+        description=(
+            "附加敏感词库文件路径，逗号分隔（与 data/sensitive_lexicon.txt "
+            "合并去重，行格式：词条<TAB>类别）。留空只用默认路径下的词库文件"
+        ),
+    )
+    gdr_sensitive_rewrites: int = Field(
+        default=1,
+        description=(
+            "生图提示词命中敏感词后，交给文字模型脱敏改写的次数，0=不改写"
+            "（命中即降级精简分镜）。改写也会再做本地复查"
+        ),
+    )
+
     # ── 输出 ──────────────────────────────────────────────
     gdr_report_width: int = Field(default=900, description="日报海报渲染宽度（像素）")
     gdr_enable_text_summary: bool = Field(default=True, description="同时推送纯文字总结（合并转发）")

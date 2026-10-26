@@ -26,6 +26,30 @@ for name in ("nonebot", "nonebot.log"):
     sys.modules[name] = mod
 sys.modules["nonebot.log"].logger = type("L", (), {
     k: staticmethod(lambda *a: None) for k in ("debug", "info", "warning", "error")})
+
+
+class _MsgSegStub:
+    """report.to_image_segment 现在返回 MessageSegment 对象，给个最小桩。"""
+
+    def __init__(self, type_, data):
+        self.type, self.data = type_, data
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    @classmethod
+    def image(cls, data: bytes) -> "_MsgSegStub":
+        return cls("image", {"file": data})
+
+
+# nonebot.adapters.onebot.v11 的包链也要先占位，importlib 才找得到
+for name in ("nonebot.adapters", "nonebot.adapters.onebot",
+             "nonebot.adapters.onebot.v11"):
+    m = t.ModuleType(name)
+    m.__path__ = []
+    sys.modules[name] = m
+sys.modules["nonebot.adapters.onebot.v11"].MessageSegment = _MsgSegStub
+
 _hr = t.ModuleType("nonebot_plugin_htmlrender")
 
 
@@ -61,6 +85,8 @@ load("report")
 report = load("report")
 load("themes")
 themes = load("themes")
+load("sensitive")
+sensitive = load("sensitive")
 
 ok = True
 
@@ -183,7 +209,62 @@ print(f"  锐评  2 维 30%+30% -> 归一化 {tot:.1f}%，颜色={[d['color'] fo
 ok = ok and abs(tot - 100.0) < 0.01 and all(d.get("color") for d in qz["dimensions"])
 
 
-# 5. 子模板渲染出的素材路径必须是相对路径。
+def _check_sensitive(checker, entries):
+    """敏感词筛查回归：用例全部从词库文件里取，代码不含任何具体词条。
+
+    Returns:
+        全部通过时返回 ``True``。
+    """
+    good = True
+
+    def hit_case(label, text, expect_hit):
+        nonlocal good
+        hits = checker.scan(text)
+        ok = bool(hits) == expect_hit
+        good = good and ok
+        print(f"  {'✓' if ok else '✗'} {label} 命中={bool(hits)} 期望={expect_hit}")
+
+    # 正例①原词：取词库中前几个互不相同的词条，原样应命中
+    # 正例②拆写：多字词条按字插入空格（归一化后仍应命中）
+    # 正例③大小写 + leet：ASCII 词条全大写应命中
+    # 负例：与群聊无关的日常文本（含英文）不得误报
+    sample_cjk = [e for e in entries if len(e.folded) >= 4 and not e.folded.isascii()][:3]
+    sample_ascii = [e for e in entries if len(e.folded) >= 4 and e.folded.isascii()][:3]
+    for e in sample_cjk:
+        hit_case(f"原词({len(e.word)}字)", e.word, True)
+        hit_case(f"拆写({len(e.word)}字)", " ".join(e.word), True)
+    for e in sample_ascii:
+        hit_case(f"大写词条({len(e.word)}字符)", e.word.upper(), True)
+    # 负例需要与词库实际词条避开：随机拼接的日常长句
+    hit_case("日常中文负例", "今天一起吃了午饭，游戏五连跪，明天下雨记得带伞", False)
+    hit_case("日常英文负例", "project deadline tomorrow, please review the docs", False)
+    return good
+
+
+# 5. 敏感词筛查（可选词库：文件不在/为空时整段静默跳过）
+print("\n=== 敏感词库与匹配 ===")
+if sensitive.PACKAGED_LEXICON.exists():
+    entries = sensitive.load_entries([sensitive.PACKAGED_LEXICON])
+    if entries:
+        has_lex = len(entries) > 1000
+        print(f"  {'✓' if has_lex else '✗'} 词库文件 词条数={len(entries)}（应 > 1000）")
+        ok = ok and has_lex
+        _checker = sensitive.SensitiveChecker(entries)
+        ok = _check_sensitive(_checker, entries) and ok
+    else:
+        print("  - 词库文件存在但为空，静默跳过筛查检查")
+else:
+    print("  - 未找到词库文件（可选组件），静默跳过筛查检查")
+
+# 6. 图片段必须是 MessageSegment（Message.append 只认它，裸 dict 会抛
+#    ValueError: Unexpected type），且 .get 接口与字典混用时行为一致
+seg = report.to_image_segment(b"\x89PNG\r\n\x1a\nfake")
+seg_ok = seg.get("type") == "image"
+print(f"  {'✓' if seg_ok else '✗'} to_image_segment 消息段 type={seg.get('type')}")
+ok = ok and seg_ok
+
+
+# 7. 子模板渲染出的素材路径必须是相对路径。
 #    这项防的是一个很隐蔽的坑：ATRI 的 quote_item / user_title_item 里写的是
 #    `{{ t2i_atri_font_mirror }}/file/x.gif`，而**渲染子模板时若没把这个变量传进去**，
 #    Jinja 会把未定义变量渲染成空串，拼出来就是 `/file/x.gif`——

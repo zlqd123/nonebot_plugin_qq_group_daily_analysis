@@ -35,4 +35,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 # 标准布局：包就是一个与仓库同名的子目录，直接指向它。
 # 主题模板和素材有 40MB，会随包一起打进去——少了它们装完渲染不出图。
+# data/ 目录是可选的外置词库位置（词库文件自备、不随包分发），
+# 若其中存在词库文件，hatchling 会作为非 .py 文件一并打入。
 packages = ["nonebot_plugin_qq_group_daily_analysis"]

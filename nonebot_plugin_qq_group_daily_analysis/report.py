@@ -6,9 +6,9 @@
 
 from __future__ import annotations
 
-import base64
 from typing import TYPE_CHECKING, Any
 
+from nonebot.adapters.onebot.v11 import MessageSegment
 from nonebot.log import logger
 
 from .stats import ChatStats
@@ -104,16 +104,20 @@ async def render_report_image_split(
     )
 
 
-def to_image_segment(data: bytes) -> dict[str, Any]:
+def to_image_segment(data: bytes) -> MessageSegment:
     """把图片字节转成 OneBot 的 base64 图片消息段。
+
+    必须返回 :class:`MessageSegment` 而不是裸 dict——发给 OneBot 的
+    ``message=[seg]`` 会经 NoneBot 的 ``Message.append()``，裸 dict 抛
+    ``ValueError: Unexpected type``（chatrecorder 的记录 hook 会连带报错）。
 
     Args:
         data: 图片字节。
 
     Returns:
-        OneBot 消息段字典。
+        OneBot 图片消息段。
     """
-    return {"type": "image", "data": {"file": f"base64://{base64.b64encode(data).decode()}"}}
+    return MessageSegment.image(data)
 
 
 def build_text_summary(

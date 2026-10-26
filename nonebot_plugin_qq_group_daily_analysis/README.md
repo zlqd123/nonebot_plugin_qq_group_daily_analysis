@@ -23,6 +23,11 @@
 >   `gdr_text_thinking` 移除（其 `extra_body` 实现是无效的 SDK 约定字段）。
 > - **落库清理修复**：VACUUM 改走 AUTOCOMMIT 连接（旧版在事务内必报错）；
 >   不再删除共享 uninfo 表的 Session/User 孤儿行。
+> - **敏感内容防护（生图链路）**：分镜要求脱敏 + 输出自查，可选外置词库
+>   （`sensitive.py`，词库文件自备、缺失即静默跳过）二次筛查 + 文字模型
+>   事后改写兜底——豆包 `400 InputTextSensitiveContentDetected` 的
+>   词源就是旧版要求「完整详情翻译为英文」进了 Background Context，
+>   现已改为中性化改写，详见「敏感内容防护（生图链路）」章节。
 
 ---
 
@@ -210,8 +215,9 @@ gdr_prompt_override="用粤语写，多用网络梗"
 1. **每个话题强制一格**——分析出的 N 个话题对应 Panel 1..N，不许模型自行裁减；
 2. **气泡中文台词 + 底部字幕条**——台词 ≤15 字、字幕条 ≤30 字，显式指定
    渲染中文原文，画面与群聊内容一眼可对上；
-3. **话题详情作为 Background Context** 附在每格提示词里（帮生图模型理解剧情，
-   同时严禁渲染成正文长文）；
+3. **话题详情脱敏改写后作为 Background Context** 附在每格提示词里（帮生图
+   模型理解剧情，同时严禁渲染成正文长文）——改写规则要求把现实人名/组织/
+   事件中性化、虚构化，是敏感内容防护的第一道（详见下文）；
 4. **结构化输出**——文字模型必须返回 `{"scene": "..."}`，插件做多层解析
    （JSON 对象 → 正则 → 数组整合），失败自动重试一次，不会把模型闲聊
    原样丢给生图 API；
@@ -219,6 +225,43 @@ gdr_prompt_override="用粤语写，多用网络梗"
    Gemini 响应跳过 `thought: true` 的思考 parts。
 
 诊断口令：日志里搜 `漫画分镜 scene`，能看到最终发给生图 API 的提示词前 300 字。
+
+### 敏感内容防护（生图链路）
+
+豆包 Seedream 对提示词里的敏感内容会直接 `400 InputTextSensitiveContentDetected`：
+图没出、配额照样扣。做 3 组对照实验可以确认：触发点不是提示词结构或长度，
+而是提示词里的**具体内容词**（群聊里的涉政表述被原样搬进生图提示词）。
+因此防护是三层，全部只作用于生图链路，日报正文/海报不受影响：
+
+1. **提示词规则层**：分镜规范要求文字模型把话题详情**脱敏改写**后再作为
+   Background Context（中性指代、虚构化），并在输出 `scene` 前自查
+   敏感词/谐音/拼音/拆字变体；
+2. **本地词库层**（`sensitive.py`，默认开）：对最终 `scene` 做二次筛查——
+   NFKC 归一化 + 去分隔符（字符间插标点/空格的**拆写**照常命中）+ 谐音/
+   拆字**变体** + ASCII leet 折叠（大小写/数字代写）。
+   本层**不随插件分发词库**：启用时自行准备词库文件（UTF-8 文本，行格式
+   `词条<TAB>类别`，`#` 为注释行），放到 `data/sensitive_lexicon.txt`，
+   或用 `gdr_sensitive_lexicon` 配置附加词库路径（逗号分隔多个）。
+   **词库是可选项**：文件不存在或为空时本层静默跳过，不影响其余防护与
+   出图；具体词条只存在于词库文件里，代码与日志均不收录；
+3. **事后层**（上游 astrbot 同款兜底）：即使生图服务仍以内容审查原因拒绝，
+   也会把**被拒绝的原提示词 + 拒绝原因原文**打包给文字模型重新生成提示词，
+   再试最后一次。
+
+筛查命中的处置顺序：文字模型脱敏改写（`gdr_sensitive_rewrites` 次，默认 1，
+改完本地复查）→ 仍命中则降级为**剥离 Background Context 的精简分镜**重出一轮
+→ 仍不行则跳过漫画，群里明示「本次漫画内容涉敏，已被生图服务拦截，已跳过」，
+而不是笼统的「漫画生成失败」。
+
+```env
+gdr_sensitive_filter=true                  # 本地筛查总开关（默认开）
+gdr_sensitive_lexicon=""                   # 附加词库路径，逗号分隔
+gdr_sensitive_rewrites=1                   # 命中后交给文字模型改写的次数
+```
+
+自查命令：`python tools/selfcheck.py`（配置了词库文件时）会附带跑词库
+完整性与匹配回归（去分隔符 / 谐音变体 / 大小写 leet / 日常文本不误伤）。
+想临时关掉只看改写效果，把 `gdr_sensitive_filter` 设为 `false` 即可。
 
 ### 生图协议（gdr_image_provider）
 
@@ -473,6 +516,10 @@ gdr_report_width=900
 | `gdr_image_extra` | `{}` | 追加原始请求字段 |
 | `gdr_image_proxy` | 空 | 代理 |
 | `gdr_image_timeout` | `300` | 超时（秒） |
+| `gdr_image_retries` | `1` | 生图失败重试次数（服务端敏感拦截不重试） |
+| `gdr_sensitive_filter` | `true` | 生图提示词本地敏感词筛查总开关 |
+| `gdr_sensitive_lexicon` | 空 | 附加敏感词库路径，逗号分隔（行格式 `词条<TAB>类别`） |
+| `gdr_sensitive_rewrites` | `1` | scene 命中后交给文字模型脱敏改写的次数 |
 | `gdr_comic_prompt` | 空 | 漫画风格提示词，空则用内置默认 |
 
 ### 输出与渲染
@@ -546,8 +593,10 @@ nonebot_plugin_qq_group_daily_analysis/
 ├── config.py       配置定义
 ├── collect.py      消息采集与清洗（时间窗口回溯 + 只分析文字 + 昵称剥离）
 ├── stats.py        纯统计：活跃度、时段分布、贡献榜、昵称压缩
-├── llm.py          文字总结模型客户端（Gemini / OpenAI 双协议）
-├── imagegen.py     生图模型客户端
+├── llm.py          文字总结模型客户端（Gemini / OpenAI 双协议）+ 分镜/改写提示词
+├── comicgen.py     生图模型客户端（多协议 + Key 轮换 + 敏感拦截分类）
+├── sensitive.py    生图链路本地敏感词筛查（归一化 + 去分隔符 + 谐音/leet 变体；
+│                   词库文件可选、自备，放 data/sensitive_lexicon.txt 即启用）
 ├── themes.py       海报渲染：翻译入参 + 复用 astrbot 原主题模板
 ├── report.py       渲染入口 + 纯文字降级 + 数据清洗
 ├── pipeline.py     主流程编排
@@ -555,7 +604,7 @@ nonebot_plugin_qq_group_daily_analysis/
 │   └── themes/     astrbot 原主题模板与素材（6 套，约 40MB）
 ├── tools/
 │   ├── sync_themes.py  从上游仓库同步模板与素材
-│   └── selfcheck.py    静态自检，不生图
+│   └── selfcheck.py    静态自检，不生图（含敏感词筛查回归）
 └── README.md
 ```
 

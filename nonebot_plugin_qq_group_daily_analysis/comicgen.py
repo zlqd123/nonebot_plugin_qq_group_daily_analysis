@@ -17,6 +17,11 @@
   按可靠性依次尝试，并对字节做图片签名校验（拒绝把 HTML/JSON 错误页
   当图片发群里）；url 下载与请求共用**同一个未关闭的** client。
 - **重试**：网络/内容异常按 ``gdr_image_retries`` 重试；429 自动轮换 Key。
+- **敏感拦截**（``ImageAPIError``）：``400 InputTextSensitiveContentDetected``
+  这类内容风控错误被单独归为 ``sensitive``——重试、换 Key 都不可能救回来，
+  原样冒泡给调用方（:mod:`pipeline`）改写提示词或明确降级提示。
+  错误码关键词覆盖 DeepSeek / OpenAI / 通义 / 千帆 / GLM 等服务商，
+  参考上游 astrbot ``_is_content_risk_error``。
 
 与生图文字提示词的配合见 :mod:`llm.build_storyboard_prompt`。
 """
@@ -47,6 +52,62 @@ DEFAULT_NATIVE_SIZES: tuple[tuple[int, int], ...] = (
 )
 
 MAX_IMAGE_BYTES = 100 * 1024 * 1024
+
+
+class ImageAPIError(RuntimeError):
+    """生图接口返回的非 200 响应（带分类标记）。
+
+    Attributes:
+        sensitive: 响应体命中内容风控关键词（重试/换 Key 无意义）。
+        rate_limited: 429 限流，应轮换下一个 Key。
+    """
+
+    def __init__(
+        self, message: str, *, sensitive: bool = False, rate_limited: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.sensitive = sensitive
+        self.rate_limited = rate_limited
+
+
+# 内容风控错误的关键词（小写比对）。覆盖豆包
+# InputTextSensitiveContentDetected、DeepSeek Content Exists Risk、
+# OpenAI/Azure content_filter、通义 DataInspectionFailed、千帆 336003……
+SENSITIVE_ERROR_PATTERNS: tuple[str, ...] = (
+    "sensitive content",
+    "sensitivecontentdetected",
+    "content exists risk",
+    "content_filter",
+    "content management policy",
+    "content_policy_violation",
+    "datainspectionfailed",
+    "inappropriate content",
+    "safety rating",
+    "harm_category",
+    "敏感词",
+    "敏感内容",
+    "安全风险",
+    "安全策略",
+    "sensitive",
+)
+
+
+def classify_api_error(message: str) -> tuple[bool, bool]:
+    """把生图接口错误文本归类为 ``(是否敏感, 是否限流)``。
+
+    Args:
+        message: 错误信息（原始响应片段也行）。
+
+    Returns:
+        ``(sensitive, rate_limited)``。
+    """
+    text = (message or "").lower()
+    if not text:
+        return False, False
+    if re.search(r"\b429\b|too many requests|rate.?limit|throttl", text):
+        return False, True
+    return any(p in text for p in SENSITIVE_ERROR_PATTERNS), False
+
 
 
 def parse_size(value: str) -> tuple[int, int] | None:
@@ -440,6 +501,12 @@ class ComicImageModel:
 
     def __init__(self, config: Config) -> None:
         self._config = config
+        self.last_error_kind: str | None = None
+        """上一次 :meth:`generate` 失败的原因：``sensitive``（服务端内容
+        风控拦截）/ ``error``（其他失败）/ ``None``（还没失败过）。"""
+        self.last_error_text: str | None = None
+        """上一次失败的错误原文（响应片段等），供调用方打包给文字模型做
+        脱敏改写时定位。敏感拦截时必填。"""
 
     @property
     def available(self) -> bool:
@@ -459,8 +526,12 @@ class ComicImageModel:
 
         Returns:
             图片字节；未配置、重试耗尽或全部失败时返回 ``None``。
+            服务端内容风控（敏感拦截）时不重试、不换 Key，直接 ``None``，
+            :attr:`last_error_kind` 置为 ``sensitive``。
         """
         cfg = self._config
+        self.last_error_kind = None
+        self.last_error_text = None
         if not cfg.gdr_image_api_keys:
             logger.warning("[群日报] 未配置 gdr_image_api_keys，跳过漫画生成")
             return None
@@ -488,6 +559,22 @@ class ComicImageModel:
                         if image is None:
                             raise RuntimeError("生图响应中提取不到图片")
                     return self._maybe_upscale(image)
+                except ImageAPIError as e:
+                    if e.sensitive:
+                        # 内容被风控拦了：重试同一提示词、换 Key 都救不回来，
+                        # 明确标记后让调用方改写提示词或降级提示。
+                        self.last_error_kind = "sensitive"
+                        self.last_error_text = str(e)
+                        logger.error(
+                            f"[群日报] 生图内容被服务端风控拦截（疑似敏感词），"
+                            f"不再重试: {e!s}"
+                        )
+                        return None
+                    last_error = e
+                    if e.rate_limited:
+                        logger.warning("[群日报] 生图 Key 已限流，切换下一个")
+                        continue
+                    logger.error(f"[群日报] 生图调用失败: {e!s}")
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 429:
                         logger.warning("[群日报] 生图 Key 已限流，切换下一个")
@@ -506,6 +593,8 @@ class ComicImageModel:
                 )
                 await asyncio.sleep(delay)
         logger.error(f"[群日报] 生图所有尝试均失败: {last_error!s}")
+        self.last_error_kind = "error"
+        self.last_error_text = str(last_error) if last_error else None
         return None
 
     # ── 尺寸处理 ──────────────────────────────────────────
@@ -575,16 +664,28 @@ class ComicImageModel:
         headers: dict[str, str],
         payload: dict[str, object],
     ) -> dict[str, Any]:
-        """发 JSON 请求并返回解析后的响应体。"""
+        """发 JSON 请求并返回解析后的响应体。
+
+        非 200 响应统一抛 :class:`ImageAPIError`（原 ``RuntimeError`` 让
+        ``generate`` 里的 ``httpx.HTTPStatusError`` 分支永远接不到 429），
+        错误体按关键词归类为敏感拦截/限流，调用方据此决定重试或直接放弃。
+        """
         resp = await client.post(url, headers=headers, json=payload)
         if resp.status_code != 200:
             snippet = resp.text[:500] if resp.text else "(空响应)"
-            raise RuntimeError(f"生图 API 请求失败 [HTTP {resp.status_code}]: {snippet}")
+            raise ImageAPIError(
+                f"生图 API 请求失败 [HTTP {resp.status_code}]: {snippet}",
+                sensitive=classify_api_error(f"[{resp.status_code}] {resp.text or ''}")[0],
+                rate_limited=resp.status_code == 429,
+            )
         try:
             return resp.json()
         except Exception as e:
             snippet = resp.text[:500] if resp.text else "(空正文)"
-            raise RuntimeError(f"生图 API 未返回合法 JSON: {snippet}") from e
+            sensitive, _ = classify_api_error(snippet)
+            raise ImageAPIError(
+                f"生图 API 未返回合法 JSON: {snippet}", sensitive=sensitive
+            ) from e
 
     async def _request_doubao(
         self, client: httpx.AsyncClient, key: str, prompt: str
