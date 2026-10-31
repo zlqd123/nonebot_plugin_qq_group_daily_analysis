@@ -4,3 +4,7 @@ data/
 __pycache__/
 *.pyc
 tools/smoke_out/
+tools/split_check_out/
+
+# Google 字体本地缓存（tools/fetch_webfonts.py 可随时重建，约 30MB）
+templates/themes/_fonts/

@@ -21,6 +21,7 @@ Playwright 手控页面，MaiBot 插件没有页面控制权，改经 plugin.py 
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -499,6 +500,12 @@ _MIME_MAP = {
 # 字体仍走本地素材服务器。整页 HTML 约 10MB，低于宿主 16MB 帧上限。
 _INLINE_MAX_BYTES = 1024 * 1024
 
+#: tools/fetch_webfonts.py 缓存的 Google 字体 CSS 目录（按 css2 查询串哈希命名）
+_WEBFONTS_CSS_DIR = THEME_DIR / "_fonts" / "css"
+
+#: 渲染后 HTML 里的 Google Fonts 样式表链接（运行时改写到本地缓存）
+_GOOGLE_CSS_RE = re.compile(r"https://fonts\.googleapis\.com/css2\?[^\"'\s]+")
+
 _SKIP_PREFIXES = ("http://", "https://", "data:", "#", "//", "about:", "javascript:", "mailto:")
 
 _CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)")
@@ -595,7 +602,34 @@ def _inline_assets(html: str, directory: str) -> str:
 
     html = _CSS_URL_RE.sub(_sub_url, html)
     html = _ATTR_RE.sub(_sub_attr, html)
-    return html
+    return _localize_webfonts(html)
+
+
+def _localize_webfonts(html: str) -> str:
+    """把 Google Fonts 样式表链接改写到 :mod:`tools.fetch_webfonts` 的本地缓存。
+
+    缓存命中才改写；未跑过缓存工具或素材服务器未启动时原样保留
+    （仍走公网，行为与上游一致，不影响任何现有流程）。
+
+    Args:
+        html: 渲染好的完整 HTML。
+
+    Returns:
+        改写后的 HTML。
+    """
+    base_url = asset_server.get_asset_base_url()
+    if not base_url:
+        return html
+
+    def _sub(m: re.Match[str]) -> str:
+        url = m.group(0)
+        query = url.split("?", 1)[1]
+        name = f"{hashlib.md5(query.encode('utf-8')).hexdigest()[:16]}.css"
+        if (_WEBFONTS_CSS_DIR / name).is_file():
+            return f"{base_url}/_fonts/css/{name}"
+        return url
+
+    return _GOOGLE_CSS_RE.sub(_sub, html)
 
 
 async def _render_html(html: str, width: int, style: str) -> bytes | None:

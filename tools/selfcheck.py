@@ -83,7 +83,7 @@ for s in themes.REPORT_STYLES:
     has = s in dirs
     ok = ok and has
     print(f"  {'✓' if has else '✗'} {s:<10} 目录存在={has}")
-extra = dirs - set(themes.REPORT_STYLES)
+extra = dirs - set(themes.REPORT_STYLES) - {"_fonts"}  # _fonts 是 fetch_webfonts 的字体缓存，非主题
 print(f"  多余目录: {extra or '无'}")
 ok = ok and not extra
 

@@ -12,7 +12,8 @@
         href="{{ t2i_google_fonts_mirror }}/css2?family=Noto+Sans+TC:wght@400;500;700;800&family=Noto+Sans+SC:wght@400;500;700&family=Outfit:wght@400;600;800&family=Share+Tech+Mono&display=swap"
         rel="stylesheet">
     <!-- cjkfonts font-face removed for T2I rendering performance; uses Noto Sans SC fallback -->
-    <script src="{{ t2i_npm_mirror }}/lucide@latest/dist/umd/lucide.js"></script>
+    <!-- lucide 已由 tools/fetch_webfonts.py 缓存到本主题目录，渲染时自动内联为 data URI -->
+    <script src="lucide.js"></script>
     <style>
         :root {
             --miku-base: #39C5BB;
