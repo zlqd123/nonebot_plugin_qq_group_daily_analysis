@@ -121,10 +121,21 @@ python tools/smoke_test.py atri   # 只渲染单个主题
 
 ## 其他工具
 
+- `tools/fetch_webfonts.py`：**把渲染依赖的公网资源全量缓存到本地**——Google
+  Fonts（5 组 css2，含 CJK 全部 unicode-range 切片）与 miku 的 lucide 图标库。
+  缓存到 `templates/themes/_fonts/`（gitignore，约 30MB，可随时重建），跑过
+  之后渲染**零公网依赖**（Google Fonts 改写到本地素材服务器、lucide 内联进
+  HTML）；未缓存的环境自动回落公网，行为与上游一致。自动尝试环境代理/本机
+  常见代理端口/直连，也可显式指定：
+  `python tools/fetch_webfonts.py [--proxy http://127.0.0.1:7897] [--dry-run]`
+  注意 `sync_themes.py` 会覆盖 miku 模板（恢复 jsdelivr 引用），同步后需还原
+  该行为相对引用 `lucide.js`。
 - `tools/sync_themes.py`：从 astrbot 上游仓库 clone 同步主题模板（整体覆盖
   `templates/themes/`，确认无手工改动后再跑）。
 - `tools/build_sensitive_lexicon.py`：从 konsheng/Sensitive-lexicon 修剪重建
   `data/sensitive_lexicon.txt`（词库自备、可选，缺省时本地筛查层静默跳过）。
+- `tools/check_split_icons.py`：分段渲染图标回归检查（playwright 实截上/下
+  半图，验证 SVG 精灵表图标与贴纸在分段后仍完整）。
 
 ## 目录结构
 
