@@ -1,16 +1,19 @@
 """日报输出：海报图片 + 纯文本摘要。
 
-海报实际由 :mod:`themes` 渲染——那里复用 astrbot 原插件的全部 8 套模板与
-素材，本模块只负责对外的入口函数和文本摘要的排版。
+移植自 nonebot 版。海报实际由 :mod:`themes` 渲染——那里复用 astrbot 原插件
+的全部 6 套模板与素材，本模块只负责对外的入口函数和文本摘要的排版。
+
+图片消息段从 OneBot 的 ``MessageSegment`` 换成通用 dict 段
+（``{"type": "image", "data": {"b64": ...}}``），由 plugin.py 的发送层
+映射到 MaiBot 的 ``ctx.send.image`` / ``ctx.send.hybrid``。
 """
 
 from __future__ import annotations
 
+import base64
 from typing import TYPE_CHECKING, Any
 
-from nonebot.adapters.onebot.v11 import MessageSegment
-from nonebot.log import logger
-
+from .log import logger
 from .stats import ChatStats
 from .themes import (
     REPORT_STYLES,
@@ -104,26 +107,25 @@ async def render_report_image_split(
     )
 
 
-def to_image_segment(data: bytes) -> MessageSegment:
-    """把图片字节转成 OneBot 的 base64 图片消息段。
-
-    必须返回 :class:`MessageSegment` 而不是裸 dict——发给 OneBot 的
-    ``message=[seg]`` 会经 NoneBot 的 ``Message.append()``，裸 dict 抛
-    ``ValueError: Unexpected type``（chatrecorder 的记录 hook 会连带报错）。
+def to_image_segment(data: bytes) -> dict[str, Any]:
+    """把图片字节转成通用图片消息段（base64）。
 
     Args:
         data: 图片字节。
 
     Returns:
-        OneBot 图片消息段。
+        ``{"type": "image", "data": {"b64": <base64 字符串>}}``。
     """
-    return MessageSegment.image(data)
+    return {
+        "type": "image",
+        "data": {"b64": base64.b64encode(data).decode("ascii")},
+    }
 
 
 def build_text_summary(
     analysis: dict[str, Any], stats: ChatStats, window_label: str = "今日"
 ) -> str:
-    """生成纯文字版日报，供合并转发使用。
+    """生成纯文字版日报，供合并发送使用。
 
     Args:
         analysis: 结构化分析结果。

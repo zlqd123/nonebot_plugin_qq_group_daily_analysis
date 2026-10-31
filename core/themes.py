@@ -1,36 +1,36 @@
 """海报主题渲染：直接复用 astrbot 原插件的模板与素材。
 
-早先的 8 套主题是照着名字手写的 CSS 变量，和上游差得很远。这里改为把
-``templates/themes/`` 下的上游模板原样跑起来，本模块只做一件事——把本插件的
-数据结构翻译成上游模板认识的入参。
+移植自 nonebot 版：6 套主题（``templates/themes/``）的上下文组装逻辑
+**原样保留**，差异只在渲染出口——nonebot 用 ``template_to_pic`` +
+Playwright 手控页面，MaiBot 插件没有页面控制权，改经 plugin.py 注入的
+渲染钩子调宿主 ``ctx.render.html2png``。
 
-上游 8 套主题的入参高度统一（16 个共享变量 + 各主题自己的 mirror），
-所以一个适配器就够了，差异全部体现在 :data:`_THEMES` 的配置里。
+两处为宿主渲染器做的适配：
 
-素材已全部落盘（ATRI 34MB 含 24MB 字体，Miku 6MB），不需要像上游那样
-在渲染时去连 GitHub CDN。只有 Google 字体仍走公网——那是字体文件本身，
-本地没有副本。
+1. **本地素材内联**。nonebot 版靠 ``page.goto(file://模板目录)`` 建立相对
+   路径基准；宿主的 html2png 拿到的只是一段 HTML 字符串，基准 URL 不可控
+   （file:// 子资源还可能被浏览器安全策略拦掉）。所以渲染前把模板 HTML 里
+   指向主题目录内的相对资源（图片/字体，ATRI 的 24MB 字体也在内）统一
+   改写为 base64 data URI，彻底自包含。Google 字体仍走公网——本地没有副本。
+2. **分段渲染**。没有 ``page.evaluate``，改为把「隐藏标记前/后 DOM」的
+   脚本直接嵌进 HTML（脚本在 ``</body>`` 前，此时全部内容已解析）。
+   若宿主渲染器不执行脚本，两次截图结果会完全一致——据此判定分段
+   不可用并返回 ``None``，调用方自动退回整图。
 """
 
 from __future__ import annotations
 
+import base64
+import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any, Awaitable, Callable
 
-from nonebot import require
-from nonebot.log import logger
+from . import asset_server
+from .log import logger
 
-if TYPE_CHECKING:
-    from .collect import ChatArchive
-    from .stats import ChatStats
+THEME_DIR = Path(__file__).resolve().parent.parent / "templates" / "themes"
 
-require("nonebot_plugin_htmlrender")
-from nonebot_plugin_htmlrender import template_to_pic  # noqa: E402
-from nonebot_plugin_htmlrender.browser import get_new_page  # noqa: E402
-
-THEME_DIR = Path(__file__).parent / "templates" / "themes"
-
-#: 可用主题名（与 gdr_report_style 的取值一致）。
+#: 可用主题名（与 report.style 的取值一致）。
 #:
 #: 只收上游 README 列出的 6 套。上游 templates/ 下另有 simple、
 #: spring_festival、BlueArchive，但不在其 README 清单内；而 ``format``
@@ -50,9 +50,7 @@ REPORT_STYLES = (
 #: ``ATRI`` / ``retro_futurism`` / ``art_nouveau`` 之类的目录名只在构建期用。
 #:
 #: ``local_mirror`` 给 ATRI/Miku 用：上游原本指向一个 GitHub CDN，这里指向
-#: 模板目录自身，素材从本地磁盘读。之所以能这么填，是因为 template_to_pic 会
-#: 先 ``page.goto("file://<模板目录>")`` 再 set_content，页面基准 URL 停在模板
-#: 目录上，相对路径因此成立。
+#: 模板目录自身。素材由 :func:`_inline_assets` 内联进 HTML，从本地磁盘读。
 #:
 #: 字体 CDN 沿用上游默认值，本地没有副本。
 _THEMES: dict[str, dict[str, Any]] = {
@@ -80,6 +78,21 @@ _FONT_SOURCE = "Mainland"
 #: 维度色板。取自 ATRI 模板自身出现最多的主色（粉、薰衣草、浅蓝），
 #: 而不是另配一套——只有 ATRI 用到，但统一提供省得按主题分支。
 _DIM_COLORS = ("#ff9ec4", "#dcd3ff", "#9cc4e8", "#ffb3c6", "#b9a7e0", "#ff8eaa")
+
+# ── 渲染钩子（plugin.py 注入，包一层宿主 ctx.render.html2png）────────
+#
+# 签名：async (html: str, width: int) -> bytes | None（PNG 字节）。
+_HTML_RENDERER: Callable[[str, int], Awaitable[bytes | None]] | None = None
+
+
+def set_html_renderer(fn: Callable[[str, int], Awaitable[bytes | None]]) -> None:
+    """注册宿主渲染钩子（plugin.py 在 on_load 时调用）。
+
+    Args:
+        fn: ``async (html, width) -> PNG bytes | None``。
+    """
+    global _HTML_RENDERER
+    _HTML_RENDERER = fn
 
 
 def _env(directory: str):
@@ -370,8 +383,8 @@ def _quality(quality: Any) -> dict[str, Any]:
 
 async def _build_theme_context(
     style: str,
-    archive: ChatArchive,
-    stats: ChatStats,
+    archive: Any,
+    stats: Any,
     analysis: dict[str, Any],
 ) -> tuple[dict[str, Any], str] | None:
     """组装上游模板渲染需要的全部入参。
@@ -456,14 +469,157 @@ async def _build_theme_context(
         "total_tokens": 0,
     }
     if local := conf.get("local_mirror"):
-        # 指向模板目录自身：素材从本地磁盘读，路径形如 ./file/xxx
+        # 指向模板目录自身：素材由 _inline_assets 从本地磁盘读并内联
         ctx[local] = "."
     return ctx, directory
 
 
+# ── 本地素材改写 ──────────────────────────────────────────────
+
+_MIME_MAP = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".bmp": "image/bmp",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+}
+
+#: 小于该字节的文件直接内联为 data URI（免一次 HTTP 往返）；更大的
+# （ATRI 的 24MB 字体）经本地素材服务器供给——内联会把 HTML 撑爆
+# 16MB 的 RPC 帧上限，渲染请求根本到不了浏览器。
+_INLINE_MAX_BYTES = 512 * 1024
+
+_SKIP_PREFIXES = ("http://", "https://", "data:", "#", "//", "about:", "javascript:", "mailto:")
+
+_CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)")
+_ATTR_RE = re.compile(r"\b(src|href)\s*=\s*(['\"])([^'\"]+)\2")
+
+
+def _to_data_uri(path: Path) -> str | None:
+    """把本地文件转成 data URI；读取失败返回 ``None``。"""
+    try:
+        if not path.is_file():
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    mime = _MIME_MAP.get(path.suffix.lower(), "application/octet-stream")
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _resolve_local(base: Path, ref: str) -> Path | None:
+    """把相对引用解析到主题目录内的文件；越界/远程引用返回 ``None``。"""
+    ref = ref.strip().strip("'\"")
+    if not ref or ref.lower().startswith(_SKIP_PREFIXES) or ref.startswith("file://"):
+        return None
+    ref = ref.split("#", 1)[0].split("?", 1)[0]
+    if not ref:
+        return None
+    try:
+        candidate = (base / ref).resolve()
+    except (OSError, ValueError):
+        return None
+    # 只处理主题目录内的文件——防拼出来的路径越界读盘
+    if base.resolve() not in candidate.parents:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _inline_assets(html: str, directory: str) -> str:
+    """把 HTML 里指向主题目录的相对资源引用改写为可访问地址。
+
+    小文件（图片等 ≤512KB）内联为 data URI；大文件（ATRI 的 24MB 字体）
+    改写到本地素材服务器的 URL——它们经 :mod:`core.asset_server` 由
+    127.0.0.1 供给，避免 HTML 超过宿主 16MB 的 RPC 帧上限。
+    远程资源（Google 字体等）与已有 data URI 原样保留。
+    服务器未启动时全部尝试内联（小主题够用；atri 大字体会失败，
+    依赖调用方按帧错误自行降级）。
+
+    Args:
+        html: 渲染好的完整 HTML。
+        directory: 主题目录名（资源解析基准）。
+
+    Returns:
+        改写后的 HTML。
+    """
+    base = THEME_DIR / directory
+    server_root = THEME_DIR.resolve()
+    base_url = asset_server.get_asset_base_url()
+
+    def _sub_url(m: re.Match[str]) -> str:
+        path = _resolve_local(base, m.group(2))
+        if path is None:
+            return m.group(0)
+        rel = path.relative_to(server_root).as_posix()
+        if base_url:
+            replacement = f"{base_url}/{rel}"
+        elif path.stat().st_size <= _INLINE_MAX_BYTES:
+            uri = _to_data_uri(path)
+            if uri is None:
+                return m.group(0)
+            replacement = uri
+        else:
+            logger.warning(
+                f"[群日报] 素材 {rel} 过大且素材服务器未启动，跳过（渲染可能缺字体）"
+            )
+            return m.group(0)
+        return m.group(0).replace(m.group(2), replacement)
+
+    def _sub_attr(m: re.Match[str]) -> str:
+        path = _resolve_local(base, m.group(3))
+        if path is None:
+            return m.group(0)
+        rel = path.relative_to(server_root).as_posix()
+        if base_url:
+            replacement = f"{base_url}/{rel}"
+        elif path.stat().st_size <= _INLINE_MAX_BYTES:
+            uri = _to_data_uri(path)
+            if uri is None:
+                return m.group(0)
+            replacement = uri
+        else:
+            return m.group(0)
+        return f"{m.group(1)}={m.group(2)}{replacement}{m.group(2)}"
+
+    html = _CSS_URL_RE.sub(_sub_url, html)
+    html = _ATTR_RE.sub(_sub_attr, html)
+    return html
+
+
+async def _render_html(html: str, width: int, style: str) -> bytes | None:
+    """内联本地素材后调宿主渲染钩子出图。
+
+    Args:
+        html: 渲染好的完整 HTML。
+        width: 渲染宽度（像素）。
+        style: 主题名（内联基准目录）。
+
+    Returns:
+        PNG 图片字节；渲染钩子未注册或渲染失败时返回 ``None``。
+    """
+    if _HTML_RENDERER is None:
+        logger.error(
+            "[群日报] 宿主渲染钩子未注册（html2png 不可用），无法生成海报"
+        )
+        return None
+    html = _inline_assets(html, style)
+    try:
+        return await _HTML_RENDERER(html, width)
+    except Exception as e:
+        logger.error(f"[群日报] {style} 主题渲染失败: {e!s}")
+        return None
+
+
 async def render_theme_image(
-    archive: ChatArchive,
-    stats: ChatStats,
+    archive: Any,
+    stats: Any,
     analysis: dict[str, Any],
     *,
     style: str = "scrapbook",
@@ -487,26 +643,25 @@ async def render_theme_image(
     ctx, directory = built
 
     try:
-        return await template_to_pic(
-            # 纯文件路径：jinja loader 直接用它，html_to_pic 内部会补 file://
-            template_path=str(THEME_DIR / directory),
-            template_name="image_template.html",
-            templates=ctx,
-            pages={"viewport": {"width": width, "height": 10}},
+        html = await _env(directory).get_template("image_template.html").render_async(
+            **ctx
         )
     except Exception as e:
-        logger.error(f"[群日报] {style} 主题渲染失败: {e!s}")
+        logger.error(f"[群日报] {style} 主题模板渲染失败: {e!s}")
         return None
+    return await _render_html(html, width, directory)
 
 
 #: 分段渲染时插在「话题」片段末尾的标记。分隔点固定在这里——
 #: 即「高亮记忆碎片」结束之后、「神人名片颁发」之前。
 _SPLIT_MARKER_ID = "gdr-split-marker"
 
-_SPLIT_SCRIPT = """
-(mode) => {
-  const m = document.getElementById('gdr-split-marker');
-  if (!m) return 'no-marker';
+# 「隐藏标记一侧 DOM」的脚本主体（移植自 nonebot 版传给 page.evaluate 的
+# 同一段 JS）。宿主渲染器没有 page.evaluate，所以这里把它包成 IIFE 直接
+# 嵌进 HTML —— 插在 </body> 前，此时文档全部内容已解析完毕。
+_SPLIT_JS_BODY = """
+  const m = document.getElementById('__MARKER_ID__');
+  if (!m) return;
   const hide = (el) => { el.style.display = 'none'; };
   const forward = mode === 'after';
   // 把标记之后（或之前）的内容逐层收集起来：
@@ -542,14 +697,31 @@ _SPLIT_SCRIPT = """
       p = p.parentElement;
     }
   }
-  return 'ok';
-}
 """
 
 
+def _split_html(html: str, mode: str) -> str:
+    """往 HTML 里注入分段隐藏脚本。
+
+    Args:
+        html: 完整 HTML。
+        mode: ``after``=隐藏标记之后的内容（上半图）；``before``=隐藏之前（下半图）。
+
+    Returns:
+        注入脚本后的 HTML。
+    """
+    body = _SPLIT_JS_BODY.replace("__MARKER_ID__", _SPLIT_MARKER_ID)
+    script = f"<script>(function() {{ const mode = '{mode}'; {body} }})();</script>"
+    lower = html.lower()
+    idx = lower.rfind("</body>")
+    if idx != -1:
+        return html[:idx] + script + html[idx:]
+    return html + script
+
+
 async def render_theme_image_split(
-    archive: ChatArchive,
-    stats: ChatStats,
+    archive: Any,
+    stats: Any,
     analysis: dict[str, Any],
     *,
     style: str = "scrapbook",
@@ -558,10 +730,12 @@ async def render_theme_image_split(
     """渲染海报并切成上下两段。
 
     切点固定在「高亮记忆碎片」结束之后、「神人名片颁发」之前。
-    做法是在话题片段末尾注入一个零高标记，渲染后用 JS 分别隐藏
-    标记前后的 DOM，再各截一张整页图——不改上游模板，6 套主题
-    通用。整页截图在页面过高时底部会出现空白，分段正是为了
-    绕开浏览器的高度上限。
+    做法是在话题片段末尾注入一个零高标记，注入「隐藏标记前/后 DOM」的
+    脚本后分别出图——不改上游模板，6 套主题通用。整页截图在页面过高时
+    底部会出现空白，分段正是为了绕开浏览器的高度上限。
+
+    宿主渲染器如果不执行页面脚本，两张图会完全一致——据此判定分段
+    不可用，返回 ``None`` 让调用方退回整图。
 
     Args:
         archive: 消息采集结果。
@@ -596,35 +770,30 @@ async def render_theme_image_split(
         + f'<div id="{_SPLIT_MARKER_ID}" style="height:0;overflow:hidden"></div>'
     )
 
-    # 先渲染成 HTML 字符串（template_to_pic 内部也是这么做的），
-    # 之后完全接管页面：先 goto 模板目录建立相对路径基准，
-    # 再 set_content——与 html_to_pic 的流程一致。
-    html = await _env(directory).get_template("image_template.html").render_async(
-        **ctx
-    )
-    base_url = f"file://{THEME_DIR / directory}"
+    try:
+        html = await _env(directory).get_template("image_template.html").render_async(
+            **ctx
+        )
+    except Exception as e:
+        logger.error(f"[群日报] {style} 主题模板渲染失败: {e!s}")
+        return None
+
+    html = _inline_assets(html, directory)
+    if _HTML_RENDERER is None:
+        logger.error("[群日报] 宿主渲染钩子未注册（html2png 不可用），无法生成海报")
+        return None
 
     try:
-        async with get_new_page(
-            2, viewport={"width": width, "height": 10}
-        ) as page:
-            page.on(
-                "console", lambda msg: logger.debug(f"浏览器控制台: {msg.text}")
-            )
-            await page.goto(base_url)
-            # 上半图：隐藏标记之后的内容
-            await page.set_content(html, wait_until="networkidle")
-            await page.evaluate(_SPLIT_SCRIPT, "after")
-            top = await page.screenshot(
-                full_page=True, type="png", timeout=30_000
-            )
-            # 下半图：重置页面后隐藏标记之前的内容
-            await page.set_content(html, wait_until="networkidle")
-            await page.evaluate(_SPLIT_SCRIPT, "before")
-            bottom = await page.screenshot(
-                full_page=True, type="png", timeout=30_000
-            )
-        return [top, bottom]
+        top = await _HTML_RENDERER(_split_html(html, "after"), width)
+        bottom = await _HTML_RENDERER(_split_html(html, "before"), width)
     except Exception as e:
         logger.error(f"[群日报] {style} 主题分段渲染失败: {e!s}")
         return None
+    if not top or not bottom:
+        return None
+    if top == bottom:
+        # 脚本没被执行（宿主渲染器禁用 JS）：两图一致说明没分切开，
+        # 退回整图，绝不能把两张一样的整图当上下半发出去。
+        logger.info("[群日报] 分段脚本未生效（渲染器不执行脚本），退回整图")
+        return None
+    return [top, bottom]

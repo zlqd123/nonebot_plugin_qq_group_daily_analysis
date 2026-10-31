@@ -1,0 +1,47 @@
+{
+  "manifest_version": 2,
+  "id": "sxpsimon.qq-group-daily-analysis",
+  "version": "1.0.0",
+  "name": "群日报",
+  "description": "生成群聊日报：统计分析 + 话题总结 + 海报图片，可顺带生成漫画并定时推送。移植自 astrbot_plugin_qq_group_daily_analysis，6 套原版主题素材完整保留。",
+  "author": {
+    "name": "SXP-Simon (原版) / MaiBot 移植",
+    "url": "https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis",
+    "homepage": "https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis",
+    "documentation": "https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis",
+    "issues": "https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis/issues"
+  },
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "1.3.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "capabilities": [
+    "send.text",
+    "send.image",
+    "send.hybrid",
+    "config.get",
+    "chat.get_stream_by_group_id",
+    "chat.get_group_streams",
+    "chat.open_session",
+    "message.get_by_time_in_chat",
+    "message.get_recent",
+    "database.query",
+    "llm.generate",
+    "render.html2png"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}

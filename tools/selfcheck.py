@@ -1,92 +1,72 @@
-"""不生图的静态自检：主题表、素材、入参映射是否都自洽。
+"""不生图的静态自检：主题表、素材、入参映射、配置模型是否都自洽。
 
-不依赖 nonebot 运行时，也不需要配任何 key：
+不依赖 MaiBot 宿主运行时，也不需要配任何 key（``maibot_sdk`` 以最小桩替代）::
 
     python tools/selfcheck.py
 """
 
 import asyncio
-import importlib.util
 import re
 import sys
 import types as t
 from pathlib import Path
 
+# Windows GBK 控制台也能打出 ✓/✗
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+
 # 插件根目录 = 本文件所在的 tools/ 的上一级，跟着仓库走而不是写死本机路径
 PLUG = Path(__file__).resolve().parent.parent
-PKG = PLUG.name  # 用真实包名注册，模块间相对导入才成立
 sys.path.insert(0, str(PLUG.parent))
 
-pkg = t.ModuleType(PKG)
-pkg.__path__ = [str(PLUG)]
-sys.modules[PKG] = pkg
-for name in ("nonebot", "nonebot.log"):
-    mod = t.ModuleType(name)
-    mod.__getattr__ = lambda n: (lambda *a, **k: None)  # noqa: E731
-    sys.modules[name] = mod
-sys.modules["nonebot.log"].logger = type("L", (), {
-    k: staticmethod(lambda *a: None) for k in ("debug", "info", "warning", "error")})
+# ── maibot_sdk 最小桩：config_model 只用到 Field / PluginConfigBase ──
+try:
+    import pydantic
+except ImportError as e:  # pragma: no cover
+    print(f"selfcheck 需要 pydantic: {e!s}")
+    sys.exit(2)
+
+_sdk = t.ModuleType("maibot_sdk")
+_sdk.Field = pydantic.Field
+_sdk.PluginConfigBase = pydantic.BaseModel
 
 
-class _MsgSegStub:
-    """report.to_image_segment 现在返回 MessageSegment 对象，给个最小桩。"""
-
-    def __init__(self, type_, data):
-        self.type, self.data = type_, data
-
-    def get(self, key, default=None):
-        return getattr(self, key, default)
-
-    @classmethod
-    def image(cls, data: bytes) -> "_MsgSegStub":
-        return cls("image", {"file": data})
+def _sdk_getattr(name: str):
+    mapping = {"Field": pydantic.Field, "PluginConfigBase": pydantic.BaseModel}
+    try:
+        return mapping[name]
+    except KeyError as e:
+        raise AttributeError(name) from e
 
 
-# nonebot.adapters.onebot.v11 的包链也要先占位，importlib 才找得到
-for name in ("nonebot.adapters", "nonebot.adapters.onebot",
-             "nonebot.adapters.onebot.v11"):
-    m = t.ModuleType(name)
-    m.__path__ = []
-    sys.modules[name] = m
-sys.modules["nonebot.adapters.onebot.v11"].MessageSegment = _MsgSegStub
+_sdk.__getattr__ = _sdk_getattr  # type: ignore[method-assign]
+sys.modules["maibot_sdk"] = _sdk
 
-_hr = t.ModuleType("nonebot_plugin_htmlrender")
-
-
-async def _stub(**_kw):
-    """本脚本不渲染。"""
-    raise NotImplementedError
-
-
-_hr.template_to_pic = _stub
-# themes.py 从子模导入 get_new_page（分段渲染用）。selfcheck 不渲染，
-# 但导入必须成立，否则 load("themes") 会 ModuleNotFoundError。
-_browser_mod = t.ModuleType("nonebot_plugin_htmlrender.browser")
-_browser_mod.get_new_page = _stub
-_hr.browser = _browser_mod
-sys.modules["nonebot_plugin_htmlrender.browser"] = _browser_mod
-sys.modules["nonebot_plugin_htmlrender"] = _hr
-import nonebot  # noqa: E402
-
-nonebot.require = lambda *a, **k: _hr
-
-
-def load(name):
-    """按路径加载模块。"""
-    s = importlib.util.spec_from_file_location(f"{PKG}.{name}", PLUG / f"{name}.py")
-    m = importlib.util.module_from_spec(s)
-    sys.modules[f"{PKG}.{name}"] = m
-    s.loader.exec_module(m)
-    return m
-
-
-load("stats")
-load("report")
-report = load("report")
-load("themes")
-themes = load("themes")
-load("sensitive")
-sensitive = load("sensitive")
+from maibot_plugin_qq_group_daily_analysis.core import report, sensitive, themes  # noqa: E402
+from maibot_plugin_qq_group_daily_analysis.core.collect import resolve_window  # noqa: E402
+from maibot_plugin_qq_group_daily_analysis.core.comicgen import (  # noqa: E402
+    build_target_url,
+    classify_api_error,
+    parse_size,
+    snap_to_native,
+    validate_image_bytes,
+)
+from maibot_plugin_qq_group_daily_analysis.core.config_model import (  # noqa: E402
+    GroupDailyAnalysisConfig,
+)
+from maibot_plugin_qq_group_daily_analysis.core.llm import (  # noqa: E402
+    build_scene_rewrite_prompt,
+    build_storyboard_prompt,
+    extract_scene,
+    strip_reasoning,
+)
+from maibot_plugin_qq_group_daily_analysis.core.scheduling import (  # noqa: E402
+    parse_cron,
+    shift_cron_back,
+)
+from maibot_plugin_qq_group_daily_analysis.core.settings import GdrConfig  # noqa: E402
 
 ok = True
 
@@ -117,7 +97,6 @@ for s in themes.REPORT_STYLES:
     print(f"  {'✓' if not miss else '✗'} {s:<10} 缺: {miss or '无'}")
 
 # 3. 入参覆盖：主模板比顶层上下文，子模板比 themes.py 实际传给它的
-#    （早先按目录整体扫，把子模板入参和 jinja 的 loop/import 也算成缺失，全是误报）
 print("\n=== 模板入参覆盖检查 ===")
 
 # 各子模板的入参由 themes.py 显式传入，不来自顶层上下文
@@ -256,19 +235,16 @@ if sensitive.PACKAGED_LEXICON.exists():
 else:
     print("  - 未找到词库文件（可选组件），静默跳过筛查检查")
 
-# 6. 图片段必须是 MessageSegment（Message.append 只认它，裸 dict 会抛
-#    ValueError: Unexpected type），且 .get 接口与字典混用时行为一致
+# 6. 图片段是通用 dict（{"type","data":{"b64"}}），发送层按 type 分流
 seg = report.to_image_segment(b"\x89PNG\r\n\x1a\nfake")
-seg_ok = seg.get("type") == "image"
-print(f"  {'✓' if seg_ok else '✗'} to_image_segment 消息段 type={seg.get('type')}")
-ok = ok and seg_ok
+seg_ok = seg.get("type") == "image" and str((seg.get("data") or {}).get("b64") or "").strip()
+print(f"  {'✓' if seg_ok else '✗'} to_image_segment 消息段 type={seg.get('type')} 带b64={bool(seg_ok)}")
+ok = ok and bool(seg_ok)
+
+# 7. 子模板渲染出的素材路径必须是相对路径（内联前）
+print("\n=== 子模板素材路径（必须是相对路径）===")
 
 
-# 7. 子模板渲染出的素材路径必须是相对路径。
-#    这项防的是一个很隐蔽的坑：ATRI 的 quote_item / user_title_item 里写的是
-#    `{{ t2i_atri_font_mirror }}/file/x.gif`，而**渲染子模板时若没把这个变量传进去**，
-#    Jinja 会把未定义变量渲染成空串，拼出来就是 `/file/x.gif`——
-#    文件系统根目录的绝对路径，浏览器必然加载失败，而且不报错、静悄悄地裂图。
 async def check_asset_paths() -> bool:
     """渲染各子模板，检查产出的素材路径可解析。
 
@@ -311,8 +287,148 @@ async def check_asset_paths() -> bool:
     return good
 
 
-print("\n=== 子模板素材路径（必须是相对路径）===")
 ok = asyncio.run(check_asset_paths()) and ok
+
+# 8. 本地素材改写：小文件内联 data URI，大文件走本地素材服务器
+print("\n=== 本地素材改写 ===")
+
+
+def check_inline_assets() -> bool:
+    """验证小素材内联、大素材走素材服务器、远程引用不动。
+
+    Returns:
+        全部通过时返回 ``True``。
+    """
+    from maibot_plugin_qq_group_daily_analysis.core import asset_server
+
+    good = True
+    atri = themes.THEME_DIR / "atri"
+    sample = next(
+        (f for f in sorted(atri.rglob("*"))
+         if f.is_file() and f.suffix.lower() in (".png", ".gif", ".webp")
+         and f.stat().st_size < 512 * 1024),
+        None,
+    )
+    if sample is not None:
+        rel = sample.relative_to(atri).as_posix()
+        html = themes._inline_assets(f'<img src="./{rel}">', "atri")
+        ok = "data:image/" in html and f"./{rel}" not in html
+        good = good and ok
+        print(f"  {'✓' if ok else '✗'} 小素材内联 data URI: {rel}")
+    else:
+        print("  - 无小于 512KB 的图片素材，跳过内联用例")
+
+    # 大文件（字体）：启动素材服务器后应改写为 127.0.0.1 URL
+    big = next(
+        (f for f in sorted(atri.rglob("*"))
+         if f.is_file() and f.suffix.lower() in (".woff2", ".ttf", ".otf")
+         and f.stat().st_size > 512 * 1024),
+        None,
+    )
+    base_url = asset_server.start_asset_server(themes.THEME_DIR)
+    if big is not None and base_url:
+        rel = big.relative_to(atri).as_posix()  # 引用相对主题目录
+        html = themes._inline_assets(
+            f'<style>@font-face {{ src: url("./{rel}") }}</style>', "atri"
+        )
+        ok = f"{base_url}/atri/{rel}" in html and "./" not in html
+        good = good and ok
+        print(f"  {'✓' if ok else '✗'} 大素材改写到本地服务器: atri/{rel}")
+    elif big is None:
+        print("  - 无大字体素材，跳过服务器用例")
+    else:
+        good = False
+        print("  ✗ 素材服务器未能启动")
+
+    # 远程与 data URI 不被二次处理
+    keep = themes._inline_assets(
+        '<img src="https://a.b/c.png"><img src="data:image/png;base64,AAA">', "atri"
+    )
+    same = keep.count("src=") == 2 and "data:image/png;base64,AAA" in keep
+    print(f"  {'✓' if same else '✗'} 远程/已有 data URI 引用保持原样")
+    asset_server.stop_asset_server()
+    return good and same
+
+
+ok = check_inline_assets() and ok
+
+# 9. 生图与文字模型工具函数
+print("\n=== 模型工具函数 ===")
+good = strip_reasoning("<think>x</think>正文") == "正文"
+good = good and strip_reasoning("<think>未闭合") == ""
+good = good and strip_reasoning("前置</think>正文") == "正文"
+scene = extract_scene('{"scene": "A 2-panel comic strip"}')
+good = good and scene == "A 2-panel comic strip"
+good = good and extract_scene("不是 json") is None
+print(f"  {'✓' if good else '✗'} strip_reasoning / extract_scene")
+
+good = classify_api_error("400 InputTextSensitiveContentDetected")[0] is True
+good = good and classify_api_error("429 Too Many Requests")[1] is True
+good = good and classify_api_error("server on fire") == (False, False)
+print(f"  {'✓' if good else '✗'} classify_api_error 敏感/限流分类")
+
+good = build_target_url("", "doubao").endswith("/api/v3/images/generations")
+good = good and build_target_url("https://api.openai.com/v1", "images").endswith("/images/generations")
+good = good and build_target_url("https://api.openai.com/v1", "chat").endswith("/chat/completions")
+print(f"  {'✓' if good else '✗'} build_target_url URL 补全")
+
+good = parse_size("2048x1152") == (2048, 1152) and parse_size("bad") is None
+good = good and snap_to_native((2048, 2048), [(1024, 1024), (1792, 1024)]) == (1024, 1024)
+try:
+    validate_image_bytes(b"<!doctype html><html>")
+    good = good and False
+except ValueError:
+    good = good and True
+print(f"  {'✓' if good else '✗'} parse_size / snap_to_native / validate_image_bytes")
+ok = ok and good
+
+# 10. 定时工具
+print("\n=== 定时工具 ===")
+good = parse_cron("0 14,22 * * *")["hour"] == "14,22"
+shifted = shift_cron_back(parse_cron("0 14,22 * * *"), 8)
+good = good and shifted == {
+    "minute": "52", "hour": "13,21", "day": "*", "month": "*", "day_of_week": "*"
+}
+good = good and shift_cron_back(parse_cron("0 0 * * *"), 8) is None  # 跨天放弃
+good = good and shift_cron_back(parse_cron("*/5 * * * *"), 8) is None  # 通配放弃
+print(f"  {'✓' if good else '✗'} parse_cron / shift_cron_back（含跨天与通配拒绝）")
+w = resolve_window("today")
+good = w[0] <= w[1] and w[2] == "今日"
+w2 = resolve_window("hours:3")
+good = good and w2[1] - w2[0] == 3 * 3600
+print(f"  {'✓' if good else '✗'} resolve_window")
+ok = ok and good
+
+# 11. 配置模型与 gdr_* 视图
+print("\n=== 配置模型与扁平视图 ===")
+cfg = GroupDailyAnalysisConfig()
+view = GdrConfig(cfg)
+good = view.gdr_timezone == "Asia/Shanghai" and view.gdr_report_style == "scrapbook"
+good = good and view.gdr_group_schedules == [] and view.gdr_member_counts == {}
+good = good and view.gdr_text_api_keys == [] and not view.gdr_text_base_url
+cfg2 = GroupDailyAnalysisConfig.model_validate({
+    "basic": {"group_schedules": [{"group_id": "123456789", "time": "14:30"}]},
+    "fetch": {"member_counts": {"123": 45}, "bot_qq": "10000"},
+    "report": {"style": "miku"},
+})
+view2 = GdrConfig(cfg2)
+good = good and view2.gdr_group_schedules == [
+    {"group_id": 123456789, "time": "14:30", "enable": True}
+]
+good = good and view2.gdr_member_counts == {123: 45} and view2.gdr_bot_qq == "10000"
+good = good and view2.gdr_report_style == "miku"
+print(f"  {'✓' if good else '✗'} 默认值 / 群时刻规整 / 成员数覆盖表")
+
+# 分镜提示词（含降级模式）构造
+topics = [{"title": "话题", "detail": "详情"}]
+sys_prompt, user_prompt = build_storyboard_prompt(topics, view2)
+good = "Panel 1" in sys_prompt and "scene" in user_prompt
+sys_deg, _ = build_storyboard_prompt(topics, view2, include_context=False)
+good = good and "Background Context" not in sys_deg
+rw_sys, rw_user = build_scene_rewrite_prompt("scene text", hits=["词A"])
+good = good and "改写" in rw_sys and "词A" in rw_user
+print(f"  {'✓' if good else '✗'} 分镜/降级分镜/改写提示词构造")
+ok = ok and good
 
 print("\n" + ("=== 全部通过 ===" if ok else "=== 存在失败 ==="))
 sys.exit(0 if ok else 1)

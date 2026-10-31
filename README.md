@@ -1,232 +1,167 @@
-<div align="center">
+# maibot_plugin_qq_group_daily_analysis（MaiBot 群日报插件）
 
-# 群日报 · NoneBot 版
+从 [astrbot_plugin_qq_group_daily_analysis](https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis)
+移植的 **MaiBot 1.x** 插件（移植蓝本为 NoneBot 版迭代），功能与素材完整保留：
 
-[![NoneBot](https://img.shields.io/badge/NoneBot2-2.x-4e5f95?style=for-the-badge&logo=nonebot&logoColor=white)](https://nonebot.dev)
-[![OneBot V11](https://img.shields.io/badge/适配-OneBot%20V11-3b82f6?style=for-the-badge)](https://github.com/botuniverse/onebot-11)
-[![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776ab?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
+- **群聊日报**：消息采集 → 统计分析 → 文字模型结构化总结（整体总结 / 话题 / 金句 /
+  用户称号 / 聊天质量锐评）→ 渲染海报推送
+- **6 套原版主题海报**：`scrapbook` 手账 / `retro` 复古未来 / `miku` 初音未来 /
+  `hack` 赛博 / `atri` 亚托莉 / `nouveau` 新艺术运动——astrbot 上游模板与素材
+  （含 ATRI 24MB 字体、Miku 素材）原样搬运、渲染前本地内联，不依赖 GitHub CDN
+- **群漫画**：每个话题强制一格的分镜提示词（气泡中文台词 + 底部字幕条）→
+  结构化解析 → 多协议生图 → 敏感词三层防护 → 服务端拦截后自动改写重试
+- **定时推送**：每群独立时刻（推荐）+ 全局 cron 兜底，支持提前采集
+- **指令**：`/群日报` 出海报、`/群日报漫画` 只出漫画、`/群日报整体` 两样都发
+  （别名 `群聊日报` / `群聊日报漫画` / `群聊日报整体`）
 
-_✨ 抓群聊历史 → 大模型结构化分析 → 渲染成长图海报推送到群里，可顺带生成漫画。 ✨_
+## 部署
 
-**本插件移植自 [astrbot 版群聊日常分析插件](https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis)，
-海报主题直接复用其全部 6 套模板与素材。**
+1. 把本目录整体复制到 MaiBot 的 `plugins/` 目录：
 
-</div>
+   ```
+   MaiBot/
+   └── plugins/
+       └── maibot_plugin_qq_group_daily_analysis/
+           ├── _manifest.json
+           ├── plugin.py
+           ├── requirements.txt
+           ├── core/…
+           ├── templates/themes/…
+           └── tools/…
+   ```
 
----
+2. 重启 MaiBot（或重载插件）。Runner 会按 `requirements.txt` 自动安装
+   `httpx / jinja2 / pillow / apscheduler`，并按 `core/config_model.py`
+   自动生成 `config.toml` 与 **WebUI 插件配置页**。
 
-- [效果](#效果)
-- [功能特色](#功能特色)
-- [安装](#安装)
-- [配置](#配置)
-- [指令](#指令)
-- [定时推送](#定时推送)
-- [海报主题](#海报主题)
-- [与原版的差异](#与原版的差异)
-- [常见问题](#常见问题)
+3. 在 WebUI 配置页（或 `plugins/maibot_plugin_qq_group_daily_analysis/config.toml`）
+   填写群号与时刻，重启生效（改动配置会触发热重载）。
 
-## 效果
+## 配置页速查
 
-海报内容包含：统计概览、时段分布、话题讨论、金句摘录、称号评定、聊天质量锐评，
-以及可选的日报漫画。六套主题共用同一套数据入参，切换 `gdr_report_style` 即可。
+全部配置在 WebUI 插件配置页分组呈现，常用的几项：
 
-| 配置值 | 主题 | 素材 |
-| :--- | :--- | :--- |
-| `scrapbook` | 手账 | 仅字体 |
-| `retro` | 复古未来 | 仅字体 |
-| `miku` | 初音未来 | 本地 6MB 立绘 |
-| `hack` | 赛博 | 仅字体 |
-| `atri` | 亚托莉 | 本地 34MB（立绘 + 表情 + 3 个 LXGW 字体） |
-| `nouveau` | 新艺术运动 | 仅字体 |
+| 分组 | 配置项 | 说明 |
+|---|---|---|
+| 基础与定时 | `group_schedules` | **每群独立推送时刻**，如 `[{"group_id": "123456789", "time": "14:30"}]`，多条可并存 |
+| 基础与定时 | `group_list` + `push_cron` | 全局 cron（默认 `0 14,22 * * *`）推给群列表，与独立时刻可共存 |
+| 基础与定时 | `enable_report` / `enable_comic` | 定时是否出海报 / 是否连带漫画（手动指令不受限） |
+| 消息采集 | `window` | 日报覆盖范围：`today` / `24h` / `yesterday` / `hours:N` |
+| 消息采集 | `prefetch_minutes` | 定时提前 N 分钟采集（默认 8，0 关闭） |
+| 消息采集 | `member_counts` | 宿主取不到群人数时的覆盖表 `{"群号": 人数}` |
+| 文字总结模型 | `base_url` + `api_keys` + `model` | **单独指定文字模型**。兼容 OpenAI `/chat/completions` 与 Gemini 两种协议，Key 429 自动轮换 |
+| 文字总结模型 | `base_url` 留空 | 回落 **MaiBot 宿主模型**（用 `model` 调 `ctx.llm.generate`） |
+| 生图模型（漫画） | `provider` | `doubao`（火山方舟 Seedream，默认）/ `images`（OpenAI）/ `google`（Gemini）/ `chat`（多模态）/ `grok`（x.ai） |
+| 生图模型（漫画） | `base_url` + `api_keys` + `model` + `size` | **单独指定生图模型**；`size_mode=upscale` 可对原生封顶的服务本地放大 |
+| 输出与提示词 | `mode` / `style` / `width` | 输出方式（image/text/both）、海报主题（6 选 1 下拉）、渲染宽度 |
+| 输出与提示词 | `prompt_style` | 提示词语气：`roast` 毒舌（默认）/ `warm` / `neutral` / `custom`（配 `prompt_override`） |
+| 敏感内容防护 | `filter` / `lexicon` / `rewrites` | 生图提示词本地词库筛查 + 文字模型脱敏改写次数 |
+| 缓存清理 | `enabled` + `cron` + `retention_days` | 定期清理插件数据目录的过期缓存文件 |
 
-> 本仓库不存放日报截图——一张海报动辄几 MB，提交进仓库会迅速膨胀。
-> 想加效果图的话，自己生成一次后命名成 `demo.png` 放进对应主题目录即可。
+### 配置示例（config.toml）
 
-## 功能特色
+```toml
+[basic]
+timezone = "Asia/Shanghai"
+enable_report = true
+enable_comic = true
 
-- **📊 群聊统计** — 消息量、活跃人数、时段分布、贡献榜、表情统计
-- **🧠 大模型话题总结** — 话题讨论、金句摘录、称号评定、聊天质量锐评
-- **🖼️ 六套海报主题** — 复用 astrbot 原版模板与 40MB 素材，**不连 GitHub CDN**
-- **🎨 日报漫画** — 每个话题一格的多格连环漫画（气泡中文台词 + 底部字幕条），分镜提示词按上游 v5.8.4 结构化生成；生图支持 doubao / images / google / chat / grok 五种协议
-- **🛡️ 敏感内容防护（生图链路）** — 分镜提示词脱敏改写 + 输出自查 + 可选外置词库二次筛查（词库文件自备、缺失即静默跳过）+ 文字模型事后改写兜底，规避生图服务的 `InputTextSensitiveContentDetected` 400
-- **⏰ 定时推送** — 支持每群独立时刻，也可退回全局 cron
-- **🔒 纯文字分析** — 剔除纯图片与合并转发消息，只分析文字
-- **⚙️ 纯 .env 配置** — 全部配置走 `gdr_` 前缀变量，**没有 HTTP 配置页**
-- **🔌 模型解耦** — 文字总结模型与生图模型完全独立配置，互不影响
+[[basic.group_schedules]]
+group_id = "123456789"
+time = "22:00"
+enable = true
 
-## 安装
+[llm]
+# 直连：填 base_url + api_keys；走宿主模型：三项都留空/留列表空
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_keys = ["AIza..."]
+model = "gemini-flash-latest"
 
-### 用 nb-cli 安装
+[image]
+provider = "doubao"
+base_url = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+api_keys = ["..."]
+model = "doubao-seedream-5-0-flash-260915"
+size = "2048x1152"
+
+[report]
+mode = "both"
+style = "scrapbook"
+prompt_style = "roast"
+```
+
+## 采集说明（与 nonebot 版的差异）
+
+- MaiBot 插件拿不到 OneBot 的 `get_group_msg_history`，消息来源改为**宿主消息库**：
+  优先 `ctx.message`（按时间窗口取），一条没拿到才回落 `ctx.db` 直查 ChatHistory
+  （`fetch.source` 可强制指定）。
+- 因此**只覆盖机器人在线期间的消息**；回溯不到窗口起点时只记日志告警，不会发到群里。
+- 昵称、时间戳、段结构做了多形状归一化（`core/collect.py::_normalize_message`），
+  兼容不同版本宿主的字段差异；群成员数取不到时用 `fetch.member_counts` 兜底，
+  保证海报上的活跃率有分母。
+
+## 渲染说明（与 nonebot 版的差异）
+
+- nonebot 版用 `nonebot-plugin-htmlrender` 手控 Playwright 页面；MaiBot 插件没有
+  页面控制权，渲染钩子改为宿主 `ctx.render.html2png`（`plugin.py` 注入）。
+- **本地素材内联**：渲染前把模板里指向主题目录的图片/字体引用统一改写为 base64
+  data URI（atri 全量内联后 HTML 约 37MB，渲染稍慢属正常），彻底摆脱对文件基准
+  URL 的依赖。Google 字体仍走公网。
+- **分段海报**（`report.split_report`）依赖宿主渲染器执行页面脚本：切点固定在
+  「高亮记忆碎片」之后、「神人名片颁发」之前；若渲染器不执行 JS（两次截图一致），
+  自动退回整图。
+
+## 本地验证（无需 MaiBot 宿主）
 
 ```bash
-nb plugin install nonebot_plugin_qq_group_daily_analysis
+python tools/selfcheck.py    # 主题完整性 / 入参覆盖 / 敏感词回归 / 配置模型 / 工具函数
+python tools/smoke_test.py   # 假宿主+假模型+假渲染器跑通全链路，6 主题 HTML 写盘到 tools/smoke_out/
+python tools/smoke_test.py atri   # 只渲染单个主题
 ```
 
-### 手动安装
+## 其他工具
 
-```bash
-git clone -b nonebot https://github.com/zlqd123/nonebot_plugin_qq_group_daily_analysis.git
-cp -r nonebot_plugin_qq_group_daily_analysis/nonebot_plugin_qq_group_daily_analysis ./plugins/
+- `tools/sync_themes.py`：从 astrbot 上游仓库 clone 同步主题模板（整体覆盖
+  `templates/themes/`，确认无手工改动后再跑）。
+- `tools/build_sensitive_lexicon.py`：从 konsheng/Sensitive-lexicon 修剪重建
+  `data/sensitive_lexicon.txt`（词库自备、可选，缺省时本地筛查层静默跳过）。
+
+## 目录结构
+
+```
+maibot_plugin_qq_group_daily_analysis/
+├── _manifest.json        # MaiBot Manifest v2
+├── plugin.py             # 入口：指令 / 定时 / 发送编排 / 宿主适配层
+├── requirements.txt      # httpx / jinja2 / pillow / apscheduler
+├── core/                 # 移植核心（包内相对导入）
+│   ├── config_model.py   # pydantic 配置模型（WebUI 配置页 schema）
+│   ├── settings.py       # gdr_* 扁平视图（移植模块按旧字段名读配置）
+│   ├── collect.py        # 消息采集与清洗（MaiBot 消息接口/DB 适配）
+│   ├── stats.py          # 统计 + 昵称压缩/还原（原样移植）
+│   ├── llm.py            # 提示词全量保留 + TextModel（直连 + 宿主回落）
+│   ├── comicgen.py       # 5 协议生图客户端（原样移植）
+│   ├── themes.py         # 6 主题上下文组装 + 素材内联 + html2png 渲染钩子
+│   ├── report.py         # 海报/文字版输出封装
+│   ├── pipeline.py       # 主编排：分析 → 敏感筛查 → 海报 → 漫画链路
+│   ├── scheduling.py     # cron 注册 / 提前采集前移（原逻辑移植）
+│   ├── cleanup.py        # 插件数据目录清理
+│   └── sensitive.py      # 本地敏感词筛查（原样移植）
+├── templates/themes/     # 6 套主题模板与素材（41MB，原样搬运）
+├── tools/                # selfcheck / smoke_test / sync_themes / build_sensitive_lexicon
+└── data/                 # （可选）sensitive_lexicon.txt
 ```
 
-### 依赖
+## 已知限制
 
-| 依赖 | 用途 |
-| :--- | :--- |
-| `nonebot2>=2.3.0` | 框架 |
-| `nonebot-adapter-onebot11>=2.3.0` | OneBot V11 适配器 |
-| `nonebot-plugin-htmlrender>=0.6.0` | 海报渲染（Playwright/Chromium） |
-| `nonebot-plugin-apscheduler>=0.4.0` | 定时推送 |
-| `nonebot-plugin-chatrecorder>=0.3.0` | 消息落库（可选用作采集源） |
+- 不移植 astrbot 版的：多平台适配、增量分析/断点恢复、WebUI 控制台、模板在线
+  安装器、trace 系统（与 NoneBot 版范围一致）。
+- 不清理 MaiBot 宿主的消息数据库（插件无权也不应该动宿主库）。
+- 宿主消息接口/DB 的返回字段若与归一化假设不符，日报昵称会退化为 QQ 号——
+  日志会给出 `昵称退化为 QQ 号` 告警，届时按日志调整
+  `core/collect.py::_normalize_message` 的字段路径即可。
 
-> ⚠️ 渲染海报需要 Chromium。首次启动 `nonebot-plugin-htmlrender` 会自动下载，
-> 约 150MB，请确保容器内有足够空间。
+## 版权与致谢
 
-## 配置
-
-在 `.env` 里加以下几行即可跑起来，完整参数见
-[包内详细文档](nonebot_plugin_qq_group_daily_analysis/README.md#全部配置项)。
-
-```env
-# ── 文字总结模型（必填）────────────────────────────
-# 列表类变量要写成 JSON 数组，单个值不要漏引号
-gdr_text_api_keys=["sk-xxx"]
-gdr_text_model="gemini-2.5-flash"
-
-# ── 海报主题 ─────────────────────────────────────
-gdr_report_style="atri"
-
-# ── 生图模型（只有要出漫画时才需要）──────────────
-gdr_image_api_keys=["ark-xxx"]
-gdr_image_model="doubao-seedream-5-0-flash-260915"
-gdr_image_size="2048x1152"
-
-# ── 生图内容安全防护（默认开，可整体不配）────────
-gdr_sensitive_filter=true
-# gdr_sensitive_lexicon=""   # 附加词库路径，逗号分隔；词库文件自备，
-#                            # 不随插件分发，缺失时该层静默跳过
-
-# ── 定时推送 ─────────────────────────────────────
-gdr_group_schedules=[{"group_id": 123456, "time": "21:00"}]
-```
-
-> 变量名小写 `gdr_` 前缀。nonebot 的配置层不区分大小写，
-> 但**列表和字典的值必须是合法 JSON**，写成 `gdr_image_api_keys=xxx` 会在启动时报
-> `SettingsError`。
-
-## 指令
-
-| 指令 | 产出 | 说明 |
-| :--- | :--- | :--- |
-| `群日报` | 海报 | 只渲染海报，不调生图 |
-| `群日报漫画` | 漫画 | 只出漫画，省掉一次海报截图 |
-| `群日报整体` | 海报 + 漫画 | 两样都发 |
-
-**三条指令共用同一次文字模型分析。** 漫画的绘图提示词是从日报那份 `analysis` 的
-`summary` 和 `topics` 派生的，所以「群日报整体」不会为了多出那张图再调一次文字模型——
-这与原版 astrbot 插件的做法一致。
-
-指令执行期间**不发「正在采集…请稍候」**，全部发完后补一句「群日报已发送，请查收」。
-
-## 定时推送
-
-```env
-# 推荐：每群独立时刻
-gdr_group_schedules=[{"group_id": 123456, "time": "21:00"}]
-
-# 或全局 cron（兼容旧配置）
-gdr_group_list=[123456]
-gdr_push_cron="0 14,22 * * *"
-```
-
-定时推送**默认连带生成漫画**（`gdr_enable_comic=true`）。该开关只管定时，
-手动指令不受影响。
-
-同一群有任务在跑时会直接拒绝重复触发，生图 API 按次计费，不做无谓重试。
-
-## 海报主题
-
-六套主题**直接复用 astrbot 原插件的模板和素材**，不是照着样子另写的：
-
-| 配置值 | 原版目录 | 素材 |
-| :--- | :--- | :--- |
-| `scrapbook` | `scrapbook` | 仅字体 |
-| `retro` | `retro_futurism` | 仅字体 |
-| `miku` | `HatsuneMiku` | 本地 6MB 立绘 |
-| `hack` | `hack` | 仅字体 |
-| `atri` | `ATRI` | 本地 34MB（立绘 + 表情 + 3 个 LXGW 字体） |
-| `nouveau` | `art_nouveau` | 仅字体 |
-
-上游 `templates/` 下还有 `simple`、`spring_festival`、`BlueArchive`，但不在其 README
-的主题清单内，故未收录；`format` 本身只是无配色的基础模板。
-
-> 字体仍走公网（Google Fonts / jsDelivr），**渲染环境需能访问外网**，断网会回退到系统字体。
-
-## 与原版的差异
-
-本插件是面向 NoneBot 的移植版，与原版 astrbot 插件并非完全等价：
-
-| 项目 | 说明 |
-| :--- | :--- |
-| **人格 / Persona** | **未迁移**。原版的人格设定与「人格标签」相关功能不包含在内 |
-| **WebUI / HTTP 配置** | **未迁移**。配置全部走 `.env` |
-| **增量分析模式** | **未迁移**。本插件每次全量分析时间窗口内的消息 |
-| **多平台** | **仅 OneBot V11**。不支持 v12、Satori、QQ 官方、Discord |
-| **群相册上传** | **未迁移** |
-| **头像** | 不拉取。模板对空值有保护，渲染为空框 |
-
-另有若干针对 nonebot 场景的取舍：同群防重入、生图全局并发上限 2、
-缺生图模型时按「定时静默 / 手动告知」区分提示。
-
-## 常见问题
-
-**Q：出图时间是错的，偏了 8 小时？**
-
-如果你在 **Windows 上直接跑**本插件，注意 `.env` 里的 `TZ=Asia/Shanghai` 是 IANA 名，
-Windows 的 CPython 解析不了（它只认 `CST-8` 这类 POSIX 写法），解析失败会退回 UTC。
-容器（Debian/Linux）有 zoneinfo，不受影响。**仅本机调试时注意。**
-
-**Q：海报图片裂了？**
-
-本仓库 40MB 素材已随包分发，正常不会裂。若仍有问题，先跑一次自检：
-
-```bash
-python nonebot_plugin_qq_group_daily_analysis/tools/selfcheck.py
-```
-
-它不生图、不需要任何 key，会检查主题表、目录、模板入参、数据映射和素材路径。
-
-**Q：没有中文粗体？**
-
-容器内需装中文字体，否则标题会退化成伪粗体：
-
-```bash
-apt-get install -y fonts-noto-cjk
-```
-
-> `apt-get` 装的东西不随容器重建保留，请写进镜像或 volume。
-
-**Q：漫画很慢？**
-
-生图是 2048×2048 出图，本来就慢。同一群的重复指令已被锁挡住。
-
-**Q：群里的日报漫画偶尔不发图，只提示「内容涉敏，已被拦截」？**
-
-生图服务会对提示词内容做风控，拦截时图没出、配额照样扣。插件已内置三层
-防护（提示词脱敏自查 → 可选词库二次筛查 → 拒绝原因打包重写兜底），
-全部失败时宁可跳过也不重试扣费。若误拦率高，可配置词库文件
-（`data/sensitive_lexicon.txt` 或 `gdr_sensitive_lexicon`，自行准备，
-见包内 README「敏感内容防护」章节）；只想完全关闭该层则设
-`gdr_sensitive_filter=false`。
-
----
-
-## 许可
-
-本插件代码以 MIT 许可发布。海报主题的模板与素材来自
-[astrbot_plugin_qq_group_daily_analysis](https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis)，
-遵循其原始许可；其中 ATRI 主题使用的 LXGW 字体为 SIL OFL 1.1。
-
-详细配置项、参数说明与实现细节见
-[nonebot_plugin_qq_group_daily_analysis/README.md](nonebot_plugin_qq_group_daily_analysis/README.md)。
+- 上游插件与主题模板素材：[SXP-Simon/astrbot_plugin_qq_group_daily_analysis](https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis)
+- ATRI / Miku 等主题素材版权归原作者所有（各主题目录内 `SOURCE-NOTICE.md` 有署名）。
+- 敏感词词源：[konsheng/Sensitive-lexicon](https://github.com/konsheng/Sensitive-lexicon)（MIT License）。

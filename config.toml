@@ -1,0 +1,97 @@
+# 群日报插件配置（MaiBot WebUI 插件配置页修改后自动回写本文件）
+# config_version 变更时 Runner 会按 core/config_model.py 自动补齐缺失字段
+
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+# ── 基础与定时 ──────────────────────────────────────────
+[basic]
+timezone = "Asia/Shanghai"
+group_list = []
+push_cron = "0 14,22 * * *"
+enable_report = true
+enable_comic = true
+# 每群独立推送时刻（推荐），示例：
+# [[basic.group_schedules]]
+# group_id = "123456789"
+# time = "22:00"
+# enable = true
+group_schedules = []
+
+# ── 消息采集 ────────────────────────────────────────────
+[fetch]
+source = "auto"
+window = "today"
+window_min_messages = 1
+history_lens = 20000
+max_messages = 4000
+prefetch_minutes = 8
+push_fetch_interval = 15.0
+fetch_page_size = 5000
+fetch_max_pages = 1
+fetch_interval = 5.0
+member_cache_ttl = 21600
+# 群成员数覆盖表，宿主取不到群人数时兜底：{ "群号": 人数 }
+member_counts = {}
+bot_qq = ""
+
+# ── 文字总结模型 ────────────────────────────────────────
+[llm]
+# base_url 留空则走 MaiBot 宿主模型；填写后走直连（OpenAI/Gemini 双协议）
+base_url = ""
+api_keys = []
+model = ""
+proxy = ""
+timeout = 300
+max_tokens = 0
+max_topics = 12
+max_quotes = 8
+max_titles = 5
+enable_quotes = true
+enable_quality = true
+
+# ── 生图模型（漫画）─────────────────────────────────────
+[image]
+provider = "doubao"
+base_url = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+api_keys = []
+model = "doubao-seedream-5-0-flash-260915"
+proxy = ""
+timeout = 300
+size = "2048x1152"
+size_mode = "native"
+native_sizes = "1024x1024,1024x1536,1536x1024,1792x1024,1024x1792"
+quality = ""
+response_format = "default"
+output_format = "default"
+watermark = "default"
+aspect_ratio = "16:9"
+optimize_prompt = "default"
+extra = {}
+comic_prompt = ""
+retries = 1
+retry_delay = 2.0
+
+# ── 输出与提示词 ────────────────────────────────────────
+[report]
+mode = "both"
+style = "scrapbook"
+width = 900
+split_report = false
+enable_text_summary = true
+send_text = false
+prompt_style = "roast"
+prompt_override = ""
+
+# ── 敏感内容防护 ────────────────────────────────────────
+[sensitive]
+filter = true
+lexicon = ""
+rewrites = 1
+
+# ── 缓存清理 ────────────────────────────────────────────
+[cleanup]
+enabled = false
+cron = "30 4 * * *"
+retention_days = 7

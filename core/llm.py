@@ -1,36 +1,31 @@
 """文字总结模型客户端与漫画分镜提示词。
 
-文字模型部分（``gdr_text_*``）兼容两种协议：
+移植自 nonebot 版，提示词（分析 JSON schema / 分镜规范 / 脱敏改写）与
+解析加固**原样保留**。调用层双模式：
 
-- base_url 含 ``googleapis.com`` 时走 Gemini ``generateContent``，
-  系统提示词放 ``systemInstruction``——contents 里连续两个 user 轮次会被
-  Gemini 以 400 拒绝（"multiturn requests alternate between user and model"）；
-- 否则走 OpenAI 兼容的 ``/chat/completions``。
+- **直连**（推荐）：base_url 含 ``googleapis.com`` 时走 Gemini
+  ``generateContent``，系统提示词放 ``systemInstruction``——contents 里连续
+  两个 user 轮次会被 Gemini 以 400 拒绝；否则走 OpenAI 兼容的
+  ``/chat/completions``。Key 429 自动轮换。
+- **宿主回落**：``llm.base_url`` 留空时经 plugin.py 注入的
+  ``host_generate`` 调 MaiBot 宿主模型（``ctx.llm.generate(model=配置的模型名)``）。
 
-响应解析按上游 v5.8.4 的经验加固：
-
-- 剥离 ``<think>…</think>`` 推理块——不少中转会把推理模型的思考原文拼进
-  ``content``，直接透传会污染下游（漫画提示词曾因此完全跑偏）；
-- Gemini 响应跳过 ``thought: true`` 的思考 parts（上游 #265 的同款处理）；
-- ``content`` 为空时回落 ``reasoning_content``。
-
-漫画分镜提示词与 ``scene`` 解析按上游 ``ComicStoryboardAnalyzer`` 移植：
-每个话题强制一格、气泡中文台词 + 底部字幕条 + Background Context，输出
-结构化 JSON（``scene`` 字段），解析有校验、失败有重试。
+响应解析按上游 v5.8.4 的经验加固：剥离 ``<think>…</think>`` 推理块、
+Gemini 跳过 ``thought: true`` 的思考 parts、``content`` 为空时回落
+``reasoning_content``。
 """
 
 from __future__ import annotations
 
 import json
 import re
+import time
 from string import Template
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import httpx
-from nonebot.log import logger
 
-from .config import Config
-from .stats import ChatStats
+from .log import logger
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -85,15 +80,23 @@ def _parse_json(raw: str) -> dict[str, Any]:
 
 
 class TextModel:
-    """文字总结模型调用封装。"""
+    """文字总结模型调用封装（直连 + 宿主回落）。"""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Any, host_generate: Callable | None = None) -> None:
+        """初始化。
+
+        Args:
+            config: ``gdr_*`` 扁平配置视图。
+            host_generate: 宿主模型回调，签名 ``async (system, user) -> str``；
+                ``llm.api_keys`` 为空时启用。
+        """
         self._config = config
+        self._host_generate = host_generate
 
     @property
     def available(self) -> bool:
-        """是否配置了可用的 Key。"""
-        return bool(self._config.gdr_text_api_keys)
+        """是否配置了可用的 Key（或宿主模型回落可用）。"""
+        return bool(self._config.gdr_text_api_keys) or self._host_generate is not None
 
     @property
     def _is_gemini(self) -> bool:
@@ -124,7 +127,7 @@ class TextModel:
 
         headers["Authorization"] = f"Bearer {key}"
         url = f"{cfg.gdr_text_base_url}/chat/completions"
-        payload: dict[str, Any] = {
+        payload = {
             "model": cfg.gdr_text_model,
             "messages": [
                 {"role": "system", "content": system},
@@ -164,23 +167,9 @@ class TextModel:
 
         return ""
 
-    async def complete(self, system: str, user: str) -> str:
-        """调用文字模型并返回文本。
-
-        Args:
-            system: 系统提示词。
-            user: 用户内容（通常是压缩后的聊天记录）。
-
-        Returns:
-            模型输出文本（已剥离思考块）。
-
-        Raises:
-            RuntimeError: 未配置 Key，或全部 Key 调用失败。
-        """
+    async def _complete_direct(self, system: str, user: str) -> str:
+        """直连模式：遍历配置的 Key 调外部 API。"""
         cfg = self._config
-        if not cfg.gdr_text_api_keys:
-            raise RuntimeError("未配置 gdr_text_api_keys，无法调用文字总结模型")
-
         last_error: Exception | None = None
         for key in cfg.gdr_text_api_keys:
             url, headers, payload = self._build_request(key, system, user)
@@ -207,6 +196,49 @@ class TextModel:
             raise RuntimeError(f"文字模型返回了空内容或未知结构: {list(body.keys())}")
 
         raise RuntimeError(f"文字模型所有 Key 均限流或失败: {last_error!s}")
+
+    async def _complete_host(self, system: str, user: str) -> str:
+        """宿主回落模式：调 MaiBot 宿主模型。"""
+        try:
+            result = await self._host_generate(system, user)
+        except Exception as e:
+            raise RuntimeError(f"宿主模型调用异常: {e!s}") from e
+        text = strip_reasoning(str(result or ""))
+        if not text.strip():
+            raise RuntimeError("宿主模型返回了空内容")
+        return text
+
+    async def complete(self, system: str, user: str) -> str:
+        """调用文字模型并返回文本。
+
+        直连与宿主回落二选一：配置了 ``llm.api_keys``（且 base_url 非空）走直连，
+        否则走宿主模型。
+
+        Args:
+            system: 系统提示词。
+            user: 用户内容（通常是压缩后的聊天记录）。
+
+        Returns:
+            模型输出文本（已剥离思考块）。
+
+        Raises:
+            RuntimeError: 无可用调用途径，或调用失败。
+        """
+        cfg = self._config
+        started = time.monotonic()
+        if cfg.gdr_text_api_keys:
+            text = await self._complete_direct(system, user)
+        elif self._host_generate is not None:
+            text = await self._complete_host(system, user)
+        else:
+            raise RuntimeError(
+                "未配置 llm.api_keys 且宿主模型不可用，无法调用文字总结模型"
+            )
+        logger.info(
+            f"[群日报] 文字模型调用完成：耗时 {time.monotonic() - started:.1f}s，"
+            f"输出 {len(text)} 字"
+        )
+        return text
 
     async def complete_json(
         self, system: str, user: str, *, retries: int = 2
@@ -248,7 +280,7 @@ class TextModel:
 # 4. 输出结构化 JSON 的 scene 字段，解析有校验、失败有重试，
 #    不再把模型的自由文本原样丢给生图 API。
 #
-# 敏感内容防护（对应 config.gdr_sensitive_*）：
+# 敏感内容防护（对应 config 的 sensitive 分组）：
 # 旧 rule 5 要求「话题完整详情**翻译为英文**附进 Background Context」——
 # 这是豆包 400 InputTextSensitiveContentDetected 的直接词源：群聊里的涉政
 # 表述被一字不落地搬进了生图提示词。现在改为：要点脱敏改写（中性化、
@@ -312,13 +344,13 @@ DEFAULT_STORYBOARD_PROMPT = (
 )
 
 
-#: ``gdr_comic_prompt`` 保留为画面风格后缀，追加在分镜规范之后。
+#: ``comic_prompt`` 保留为画面风格后缀，追加在分镜规范之后。
 _STYLE_SUFFIX = "\n【画面风格要求】\n{style}\n"
 
 
 def build_storyboard_prompt(
     topics: list[dict[str, Any]],
-    config: Config,
+    config: Any,
     *,
     include_context: bool = True,
 ) -> tuple[str, str]:
@@ -326,7 +358,7 @@ def build_storyboard_prompt(
 
     Args:
         topics: 结构化话题列表（``title`` / ``detail``）。
-        config: 插件配置。
+        config: ``gdr_*`` 扁平配置视图。
         include_context: 是否让分镜携带话题详情的脱敏摘要上下文。
             ``False`` 为降级模式：话题详情不进用户内容，也不要求生成
             Background Context（本地敏感词筛查反复命中时的最后形态）。
@@ -426,7 +458,6 @@ def build_scene_rewrite_prompt(
         listing = "\n".join(f"- {h}" for h in hits)
         parts.append("【本地词库命中的词条】\n" + listing)
     return _SENSITIVE_REWRITE_SYSTEM, "\n\n".join(parts)
-
 
 
 def _extract_text_chunks(obj: object, depth: int = 0) -> list[str]:
@@ -568,11 +599,11 @@ def _style_guide(style: str) -> str:
     return _STYLE_GUIDES[key]
 
 
-def _custom_prompt(config: Config) -> str:
+def _custom_prompt(config: Any) -> str:
     """拼装自定义提示词。
 
     Args:
-        config: 插件配置。
+        config: ``gdr_*`` 扁平配置视图。
 
     Returns:
         要追加的文本；没配则为空串。
@@ -582,22 +613,23 @@ def _custom_prompt(config: Config) -> str:
 
 
 def build_analysis_prompt(
-    stats: ChatStats,
+    stats: Any,
     chat_lines: list[str],
     code_to_name: dict[str, str],
-    config: Config,
+    config: Any,
     window_label: str = "今日",
 ) -> tuple[str, str]:
     """构造结构化分析用的系统提示词与用户内容。
 
-    ``gdr_enable_quotes`` / ``gdr_enable_quality`` 关闭时，对应字段直接从
+    ``enable_quotes`` / ``enable_quality`` 关闭时，对应字段直接从
     JSON 结构与硬性要求里移除，不再只是「配置了不生效」的死开关。
 
     Args:
-        stats: 统计结果。
+        stats: 统计结果（:class:`core.stats.ChatStats`）。
         chat_lines: 昵称压缩后的聊天记录。
         code_to_name: 代号到昵称的映射。
-        config: 插件配置。
+        config: ``gdr_*`` 扁平配置视图。
+        window_label: 统计范围标签。
 
     Returns:
         ``(系统提示词, 用户内容)``。

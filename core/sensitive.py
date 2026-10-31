@@ -4,7 +4,7 @@
 ``400 InputTextSensitiveContentDetected``，浪费配额还不给图。
 
 本模块做**二次筛查**：词库文件（可选、自备，默认找
-``data/sensitive_lexicon.txt``）+ 用户配置的附加词库
+插件目录 ``data/sensitive_lexicon.txt``）+ 用户配置的附加词库
 （``gdr_sensitive_lexicon``），对交给生图模型的提示词做归一化匹配——
 
 - 归一化：NFKC 折叠全角/繁简符号、去零宽字符与 CQ 码、统一小写；
@@ -28,9 +28,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from nonebot.log import logger
+from .log import logger
 
-PACKAGED_LEXICON = Path(__file__).resolve().parent / "data" / "sensitive_lexicon.txt"
+PACKAGED_LEXICON = Path(__file__).resolve().parent.parent / "data" / "sensitive_lexicon.txt"
 """默认词库查找路径；词库自备、可选，文件不在时静默跳过本层筛查。"""
 
 # 归一化时保留的字符：CJK 汉字（含扩展区）、拉丁字母、数字。其余（标点、

@@ -36,9 +36,9 @@ from math import gcd
 from typing import Any
 
 import httpx
-from nonebot.log import logger
+from .log import logger
 
-from .config import Config
+from typing import Any  # noqa: F401  （config 为 gdr_* 扁平视图，鸭子类型）
 
 # OpenAI 的 gpt-image-1 / dall-e-3 原生规格上限（1792），都不含 2048x2048，
 # 所以 ups 模式要靠本地放大补齐。其他服务商（如火山方舟 Seedream）本身支持

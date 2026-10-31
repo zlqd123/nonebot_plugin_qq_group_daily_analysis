@@ -1,15 +1,18 @@
 """日报生成主流程编排。
 
-串联：采集 → 统计 → 文字分析 → 渲染图片 → （可选）生成漫画。
+移植自 nonebot 版，编排逻辑**原样保留**：
+采集 → 统计 → 文字分析 → 渲染图片 → （可选）生成漫画。
+
+差异只有两处：``bot: Bot`` 换成宿主适配对象 ``host``（plugin.py 注入，
+由 MaiBot 消息接口取数）；发送层不在这里——产出的是通用消息段 dict，
+由 plugin.py 映射到 ``ctx.send``。
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
-from typing import TYPE_CHECKING, Any, Sequence
-
-from nonebot.log import logger
+from typing import TYPE_CHECKING, Any
 
 from .collect import _fmt, fetch_group_archive, resolve_window
 from .comicgen import ComicImageModel
@@ -21,6 +24,7 @@ from .llm import (
     extract_scene,
     strip_reasoning,
 )
+from .log import logger
 from .report import (
     build_text_summary,
     render_report_image,
@@ -31,11 +35,7 @@ from .sensitive import SensitiveChecker, format_word_list, get_checker
 from .stats import analyze, compress_nicknames, restore_nicknames
 
 if TYPE_CHECKING:
-    from nonebot.adapters.onebot.v11 import Bot
-
     from .collect import ChatArchive
-    from .config import Config
-    from .stats import ChatStats
 
 #: 分镜提示词解析失败后的重试次数（独立于生图 API 自身的重试）
 _STORYBOARD_RETRIES = 1
@@ -53,7 +53,7 @@ async def _sanitize_scene(
     scene: str,
     checker: SensitiveChecker | None,
     text_model: TextModel,
-    config: Config,
+    config: Any,
 ) -> str | None:
     """生图提示词的本地敏感词二次筛查与脱敏改写。
 
@@ -68,7 +68,7 @@ async def _sanitize_scene(
         scene: 文字模型产出的生图提示词。
         checker: 筛查器；``None`` 表示本地筛查关闭，原样放行。
         text_model: 文字模型客户端。
-        config: 插件配置（读 ``gdr_sensitive_rewrites``）。
+        config: ``gdr_*`` 扁平配置视图（读 ``gdr_sensitive_rewrites``）。
 
     Returns:
         通过筛查的提示词；筛不掉时返回 ``None``。
@@ -152,9 +152,10 @@ async def _force_rewrite(
     return rewritten
 
 
-async def _run_comic(model: ComicImageModel,
+async def _run_comic(
+    model: ComicImageModel,
     analysis: dict[str, Any],
-    config: Config,
+    config: Any,
     text_model: TextModel,
     notices: list[str],
 ) -> bytes | None:
@@ -174,7 +175,7 @@ async def _run_comic(model: ComicImageModel,
     Args:
         model: 生图模型客户端。
         analysis: 已完成的分析结果。
-        config: 插件配置。
+        config: ``gdr_*`` 扁平配置视图。
         text_model: 文字模型客户端，用来产出分镜 scene 提示词。
         notices: 需要随日报发到群里的告警文案（本函数按需往里 append）。
 
@@ -275,9 +276,9 @@ async def _run_comic(model: ComicImageModel,
 
 
 async def generate_daily_report(
-    bot: Bot,
+    host: Any,
     group_id: int,
-    config: Config,
+    config: Any,
     *,
     text_model: TextModel,
     image_model: ComicImageModel,
@@ -286,16 +287,16 @@ async def generate_daily_report(
     notify_missing_comic: bool = False,
     poster: bool = True,
     archive: ChatArchive | None = None,
-) -> tuple[list[Any], ChatStats | None, ChatArchive | None]:
+) -> tuple[list[Any], Any | None, ChatArchive | None]:
     """生成一份群日报的**消息段**（本函数不负责发送）。
 
     采集阶段会多取一些消息，真正决定日报范围的是随后的
-    :meth:`ChatArchive.filter_window`——按 ``gdr_window`` 截取时间窗口。
+    :meth:`ChatArchive.filter_window`——按 ``fetch.window`` 截取时间窗口。
 
     Args:
-        bot: OneBot v11 机器人实例。
+        host: 宿主适配对象（MaiBot 消息接口封装）。
         group_id: 群号。
-        config: 插件配置。
+        config: ``gdr_*`` 扁平配置视图。
         text_model: 文字模型客户端。
         image_model: 生图模型客户端。
         with_comic: 是否在日报之外附带一张漫画。
@@ -305,7 +306,7 @@ async def generate_daily_report(
         notify_missing_comic: 没配生图模型、漫画出不来时，是否在群里提示。
             定时推送传 ``False``：那个点没人在看，报缺 key 纯属噪音，
             日志里已经记了。只有用户主动敲漫画指令时才值得告诉他为什么没图。
-        poster: 是否渲染海报。定时推送配合 ``gdr_enable_report=false``
+        poster: 是否渲染海报。定时推送配合 ``enable_report=false``
             传 ``False``（只发文字/漫画）；手动指令恒为 ``True``。
         archive: **已经采集好的**消息。给了就跳过采集直接进入分析，
             用于定时推送提前若干分钟把消息先拉回来、到点再出图。
@@ -314,27 +315,26 @@ async def generate_daily_report(
     Returns:
         ``(消息段列表, 统计结果, 采集结果)``；无可用内容时消息段为空。
     """
-    # 先定窗口，再按窗口起点回溯——顺序反了就只能「抓够 N 条」而不是「抓够时间」
+    # 先定窗口，再按窗口起点取数——顺序反了就只能「抓够 N 条」而不是「抓够时间」
     start_ts, end_ts, window_label = resolve_window(config.gdr_window)
     notices: list[str] = []
 
     if archive is None:
         archive = await fetch_group_archive(
-            bot,
+            host,
             group_id,
             history_lens=config.gdr_history_lens,
             source=config.gdr_source,
-            page_size=config.gdr_fetch_page_size,
-            max_pages=config.gdr_fetch_max_pages,
-            interval=config.gdr_fetch_interval,
             member_cache_ttl=config.gdr_member_cache_ttl,
-            self_id=bot.self_id,
+            self_id=host.self_id,
             since_ts=start_ts,
+            end_ts=end_ts,
+            member_counts=config.gdr_member_counts,
         )
     else:
         logger.info(
             f"[群日报] 群 {group_id} 使用提前采集的结果"
-            f"（{len(archive.messages)} 条），不再重复调用 OneBot API"
+            f"（{len(archive.messages)} 条），不再重复调用宿主消息接口"
         )
     if not archive.messages:
         logger.warning(f"[群日报] 群 {group_id} 未采集到消息")
@@ -342,7 +342,7 @@ async def generate_daily_report(
 
     archive.window_label = window_label
 
-    # 采集已按窗口起点回溯，这里只做最后的边界收口
+    # 采集已按窗口起点取数，这里只做最后的边界收口
     dropped = archive.filter_window(start_ts, end_ts)
     if dropped:
         logger.info(
@@ -355,8 +355,8 @@ async def generate_daily_report(
         covered = (archive.last_time - archive.first_time) / 3600 if archive.first_time else 0
         logger.warning(
             f"[群日报] 群 {group_id} 实际最早消息为 {_fmt(archive.first_time)}，"
-            f"未回溯到窗口起点 {_fmt(start_ts)}，仅覆盖 {covered:.1f} 小时（"
-            f"{window_label}）；如需更多请调大 gdr_fetch_page_size"
+            f"未覆盖到窗口起点 {_fmt(start_ts)}，仅覆盖 {covered:.1f} 小时（"
+            f"{window_label}）；MaiBot 只记录机器人在线期间的消息"
         )
 
     if len(archive.messages) < config.gdr_window_min_messages:
@@ -374,8 +374,13 @@ async def generate_daily_report(
     system, user = build_analysis_prompt(
         stats, chat_lines, code_to_name, config, window_label
     )
+    logger.info(
+        f"[群日报] 群 {group_id} 开始文字分析：模型 {config.gdr_text_model}，"
+        f"送入 {len(chat_lines)} 条，提示词约 {len(system) + len(user)} 字"
+    )
     try:
         analysis = await text_model.complete_json(system, user)
+        logger.info(f"[群日报] 群 {group_id} 文字分析完成，开始组装渲染数据")
     except Exception as e:
         logger.error(f"[群日报] 文字分析失败: {e!s}")
         return [], stats, archive
@@ -428,9 +433,13 @@ async def generate_daily_report(
     segments: list[Any] = []
 
     # 「群日报漫画」只要漫画：跳过海报渲染，省掉一次 HTML 截图；
-    # 定时推送可用 gdr_enable_report=false 关掉海报（poster=False）
+    # 定时推送可用 enable_report=false 关掉海报（poster=False）
     if poster and config.gdr_report_mode in ("image", "both") and not comic_only:
         images: list[bytes] = []
+        logger.info(
+            f"[群日报] 群 {group_id} 开始渲染海报：主题 {config.gdr_report_style}，"
+            f"宽 {config.gdr_report_width}px"
+        )
         if config.gdr_split_report:
             parts = await render_report_image_split(
                 archive,
@@ -454,8 +463,24 @@ async def generate_daily_report(
             )
             if image:
                 images = [image]
+            else:
+                # 整图渲染失败（宿主帧大小上限/渲染器异常）时自动尝试分段
+                parts = await render_report_image_split(
+                    archive,
+                    stats,
+                    analysis,
+                    width=config.gdr_report_width,
+                    style=config.gdr_report_style,
+                )
+                if parts:
+                    logger.info("[群日报] 整图渲染失败，已自动改用分段渲染")
+                    images = parts
         if images:
             segments.extend(to_image_segment(img) for img in images)
+            logger.info(
+                f"[群日报] 群 {group_id} 海报渲染完成：{len(images)} 张，"
+                f"共 {sum(len(i) for i in images) // 1024}KB"
+            )
         else:
             # 静默降级会让人误以为「插件只输出文字」，所以明确告诉用户
             logger.warning("[群日报] 海报渲染失败，降级为纯文字")
@@ -464,9 +489,9 @@ async def generate_daily_report(
     # 只要漫画时，若漫画也没出来就没什么可发的了，不该再补一段正文
     if (with_comic or comic_only) and not image_model.available:
         if notify_missing_comic:
-            notices.append("未配置 gdr_image_api_keys，漫画已跳过")
+            notices.append("未配置 image.api_keys，漫画已跳过")
         else:
-            logger.warning("[群日报] 未配置 gdr_image_api_keys，跳过漫画（不打扰群里）")
+            logger.warning("[群日报] 未配置 image.api_keys，跳过漫画（不打扰群里）")
 
     # 纯文字段：显式要求时给，或海报没出来时兜底
     want_text = not comic_only and (
@@ -480,9 +505,11 @@ async def generate_daily_report(
 
     if (with_comic or comic_only) and image_model.available:
         async with _COMIC_SEM:
+            logger.info(f"[群日报] 群 {group_id} 开始生成漫画")
             comic = await _run_comic(image_model, analysis, config, text_model, notices)
             if comic:
                 segments.append(to_image_segment(comic))
+                logger.info(f"[群日报] 群 {group_id} 漫画生成完成（{len(comic) // 1024}KB）")
             elif not notices:
                 notices.append("漫画生成失败（详见日志）")
 
