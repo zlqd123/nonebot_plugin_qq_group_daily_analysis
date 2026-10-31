@@ -26,6 +26,28 @@ _BASE_URL: str = ""
 class _ThemeHandler(SimpleHTTPRequestHandler):
     """把 ``/<主题>/<路径>`` 映射到 templates/themes/ 下的静态文件。"""
 
+    # 渲染页面（宿主 html2png 用 file:///data: 装载，属跨源请求）必须拿到
+    # 正确的 Content-Type，否则 Chromium ORB 会拦掉图片，woff2 字体也会因
+    # 缺 CORS 头被拒。stdlib 的 mimetypes 在部分 Windows 环境认不出 webp/woff2。
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".svg": "image/svg+xml",
+        ".woff": "font/woff",
+        ".woff2": "font/woff2",
+        ".ttf": "font/ttf",
+        ".otf": "font/otf",
+    }
+
+    def end_headers(self) -> None:
+        """所有响应带 CORS 头：跨源 <img> 与 @font-face 字体加载的前提。"""
+        self.send_header("Access-Control-Allow-Origin", "*")
+        super().end_headers()
+
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
         """静默访问日志（每个海报几十个请求，打日志纯噪音）。"""
         return

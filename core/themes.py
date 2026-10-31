@@ -494,7 +494,10 @@ _MIME_MAP = {
 #: 小于该字节的文件直接内联为 data URI（免一次 HTTP 往返）；更大的
 # （ATRI 的 24MB 字体）经本地素材服务器供给——内联会把 HTML 撑爆
 # 16MB 的 RPC 帧上限，渲染请求根本到不了浏览器。
-_INLINE_MAX_BYTES = 512 * 1024
+# 小素材内联阈值：atri 的动图 sticker 0.5~0.8MB，1MB 档能把它们全部
+# 内联成 data URI（跨源渲染不会被 Chromium ORB 拦截）；ATRI 的 24MB
+# 字体仍走本地素材服务器。整页 HTML 约 10MB，低于宿主 16MB 帧上限。
+_INLINE_MAX_BYTES = 1024 * 1024
 
 _SKIP_PREFIXES = ("http://", "https://", "data:", "#", "//", "about:", "javascript:", "mailto:")
 
@@ -553,22 +556,30 @@ def _inline_assets(html: str, directory: str) -> str:
     server_root = THEME_DIR.resolve()
     base_url = asset_server.get_asset_base_url()
 
+    def _replacement(path: Path, rel: str) -> str | None:
+        """小文件一律 data URI（跨源渲染最稳），大文件走素材服务器。
+
+        返回 ``None`` 表示没有可用改写（调用方保留原引用）。
+        """
+        if path.stat().st_size <= _INLINE_MAX_BYTES:
+            uri = _to_data_uri(path)
+            if uri is not None:
+                return uri
+        if base_url:
+            return f"{base_url}/{rel}"
+        if path.stat().st_size > _INLINE_MAX_BYTES:
+            logger.warning(
+                f"[群日报] 素材 {rel} 过大且素材服务器未启动，跳过（渲染可能缺字体）"
+            )
+        return None
+
     def _sub_url(m: re.Match[str]) -> str:
         path = _resolve_local(base, m.group(2))
         if path is None:
             return m.group(0)
         rel = path.relative_to(server_root).as_posix()
-        if base_url:
-            replacement = f"{base_url}/{rel}"
-        elif path.stat().st_size <= _INLINE_MAX_BYTES:
-            uri = _to_data_uri(path)
-            if uri is None:
-                return m.group(0)
-            replacement = uri
-        else:
-            logger.warning(
-                f"[群日报] 素材 {rel} 过大且素材服务器未启动，跳过（渲染可能缺字体）"
-            )
+        replacement = _replacement(path, rel)
+        if replacement is None:
             return m.group(0)
         return m.group(0).replace(m.group(2), replacement)
 
@@ -577,14 +588,8 @@ def _inline_assets(html: str, directory: str) -> str:
         if path is None:
             return m.group(0)
         rel = path.relative_to(server_root).as_posix()
-        if base_url:
-            replacement = f"{base_url}/{rel}"
-        elif path.stat().st_size <= _INLINE_MAX_BYTES:
-            uri = _to_data_uri(path)
-            if uri is None:
-                return m.group(0)
-            replacement = uri
-        else:
+        replacement = _replacement(path, rel)
+        if replacement is None:
             return m.group(0)
         return f"{m.group(1)}={m.group(2)}{replacement}{m.group(2)}"
 
@@ -662,7 +667,10 @@ _SPLIT_MARKER_ID = "gdr-split-marker"
 _SPLIT_JS_BODY = """
   const m = document.getElementById('__MARKER_ID__');
   if (!m) return;
-  const hide = (el) => { el.style.display = 'none'; };
+  // SVG 精灵表（<symbol> 集合）零尺寸不可见，但一旦被 display:none，
+  // 文档里所有 <use> 图标引用全部失效——分段两侧都必须保留它。
+  const hasSprite = (el) => !!(el.querySelector && el.querySelector('symbol'));
+  const hide = (el) => { if (!hasSprite(el)) el.style.display = 'none'; };
   const forward = mode === 'after';
   // 把标记之后（或之前）的内容逐层收集起来：
   // 先收标记的同级，再收父级的同级，直到根。这样文档序里
@@ -672,7 +680,7 @@ _SPLIT_JS_BODY = """
   while (node && node !== document.documentElement) {
     let sib = forward ? node.nextElementSibling : node.previousElementSibling;
     while (sib) {
-      list.push(sib);
+      if (!hasSprite(sib)) list.push(sib);
       sib = forward ? sib.nextElementSibling : sib.previousElementSibling;
     }
     node = node.parentElement;
