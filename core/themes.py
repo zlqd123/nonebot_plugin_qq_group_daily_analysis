@@ -1097,7 +1097,7 @@ async def render_theme_image_cards(
     style: str = "scrapbook",
     width: int = 900,
     per_page: int = 2,
-    max_pages: int = 8,
+    max_pages: int = 5,
 ) -> list[bytes] | None:
     """按卡片粒度把海报拆成多张图，每张约 ``per_page`` 个条目卡片。
 
