@@ -17,11 +17,13 @@ from .log import logger
 from .stats import ChatStats
 from .themes import (
     REPORT_STYLES,
+    RenderOversizeError,
     clean_quality,
     clean_quotes,
     clean_titles,
     clean_topics,
     render_theme_image,
+    render_theme_image_banded,
     render_theme_image_split,
 )
 
@@ -105,6 +107,32 @@ async def render_report_image_split(
     return await render_theme_image_split(
         archive, stats, analysis, style=_safe_style(style), width=width
     )
+
+
+async def render_report_image_banded(
+    archive: ChatArchive,
+    stats: ChatStats,
+    analysis: dict[str, Any],
+    *,
+    width: int = 900,
+    style: str = "scrapbook",
+) -> list[bytes] | None:
+    """把日报渲染成 N 等份像素带（帧超限自动加密块数）。
+
+    语义分段和整图都超宿主 16MB RPC 帧上限时的最后手段，详见
+    :func:`themes.render_theme_image_banded`。
+
+    Returns:
+        PNG 列表；渲染钩子不支持区域截图或切块数用尽仍超限时返回
+        ``None``。
+    """
+    try:
+        return await render_theme_image_banded(
+            archive, stats, analysis, style=_safe_style(style), width=width
+        )
+    except RenderOversizeError:
+        # 理论上 banded 内部已消化超限；兜底不让异常逃出编排层
+        return None
 
 
 def to_image_segment(data: bytes) -> dict[str, Any]:

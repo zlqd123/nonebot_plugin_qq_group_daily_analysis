@@ -409,8 +409,21 @@ class GroupDailyAnalysisPlugin(MaiBotPlugin):
             return str(result.get("response") or "")
         return str(result or "")
 
-    async def _render_html_to_png(self, html: str, width: int) -> bytes | None:
-        """渲染钩子：包一层宿主 ``ctx.render.html2png``，返回 PNG 字节。"""
+    async def _render_html_to_png(
+        self, html: str, width: int, selector: str = "body"
+    ) -> bytes | None:
+        """渲染钩子：包一层宿主 ``ctx.render.html2png``，返回 PNG 字节。
+
+        Args:
+            html: 完整 HTML。
+            width: 视口宽度。
+            selector: 元素选择器；非 ``body`` 时只截该元素覆盖的页面区域
+                （像素带切片用）。宿主渲染器对非 body selector 走元素截图。
+
+        Raises:
+            RenderOversizeError: 渲染结果超过宿主 RPC 帧上限——上层据此
+                换分段/像素带策略重试。
+        """
         render = getattr(self.ctx, "render", None)
         html2png = getattr(render, "html2png", None) if render else None
         if not callable(html2png):
@@ -419,13 +432,15 @@ class GroupDailyAnalysisPlugin(MaiBotPlugin):
         try:
             result = await html2png(
                 html,
+                selector=selector,
                 viewport={"width": width, "height": 10},
                 # 宿主有 16MB 帧大小上限：默认 2 倍像素密度会把长图顶爆
                 # （900px 宽 ×2 × 6000+px 高 ≈ 45MB），降到 1 倍
                 device_scale_factor=1.0,
-                # 海报是整页长图，默认 False 只截视口高度
+                # 海报是整页长图，默认 False 只截视口高度；
+                # 元素截图（selector 非 body）时此参数被忽略
                 full_page=True,
-                # 主题模板的 Google 字体走公网，必须放行网络
+                # 本地素材服务器/缓存的字体都要走本机网络
                 allow_network=True,
                 # 等字体/远程资源加载完再截
                 wait_until="networkidle",
@@ -433,6 +448,8 @@ class GroupDailyAnalysisPlugin(MaiBotPlugin):
                 render_timeout_ms=120_000,
             )
         except Exception as e:
+            if "超过最大限制" in str(e):
+                raise themes.RenderOversizeError(str(e)) from e
             logger.error(f"[群日报] html2png 渲染失败: {e!s}")
             return None
         if isinstance(result, (bytes, bytearray)):
@@ -639,6 +656,9 @@ class GroupDailyAnalysisPlugin(MaiBotPlugin):
         """
         assert self.settings is not None
         images = [s for s in segments if s.get("type") == "image"]
+        # 海报图是主体；海报挂了的话，文字摘要必须补上（哪怕漫画图还在），
+        # 否则群里只有一张漫画、日报正文完全缺失
+        has_poster = any(s.get("poster") for s in images)
         notices = "\n".join(
             str((s.get("data") or {}).get("text") or "")
             for s in segments
@@ -650,7 +670,7 @@ class GroupDailyAnalysisPlugin(MaiBotPlugin):
             if s.get("type") != "image" and not s.get("notice")
         ).strip()
 
-        texts = body if (self.settings.gdr_send_text or not images) else ""
+        texts = body if (self.settings.gdr_send_text or not has_poster) else ""
         parts = [t for t in (notices, texts) if t]
 
         if parts:

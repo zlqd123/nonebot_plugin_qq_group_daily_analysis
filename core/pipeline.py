@@ -26,8 +26,10 @@ from .llm import (
 )
 from .log import logger
 from .report import (
+    RenderOversizeError,
     build_text_summary,
     render_report_image,
+    render_report_image_banded,
     render_report_image_split,
     to_image_segment,
 )
@@ -440,6 +442,9 @@ async def generate_daily_report(
             f"[群日报] 群 {group_id} 开始渲染海报：主题 {config.gdr_report_style}，"
             f"宽 {config.gdr_report_width}px"
         )
+        # 渲染策略链：语义分段 → 整图（重试一次）→ 像素带自适应切片
+        # （4→8→16→32 块，帧超限自动翻倍）。宿主 16MB RPC 帧上限卡的是
+        # 渲染结果本身，所以「发不出图」只能靠切块重试解决，不降级文字。
         if config.gdr_split_report:
             parts = await render_report_image_split(
                 archive,
@@ -451,40 +456,51 @@ async def generate_daily_report(
             if parts:
                 images = parts
             else:
-                # 无话题或分隔点后没有内容时退回整图
-                logger.info("[群日报] 分段不可用，退回整图")
+                # 无话题、分隔点后没内容，或两段仍超帧上限
+                logger.info("[群日报] 分段不可用，尝试整图")
         if not images:
-            image = await render_report_image(
+            for attempt in (1, 2):
+                try:
+                    image = await render_report_image(
+                        archive,
+                        stats,
+                        analysis,
+                        width=config.gdr_report_width,
+                        style=config.gdr_report_style,
+                    )
+                except RenderOversizeError:
+                    logger.info(f"[群日报] 整图第 {attempt} 次渲染超帧上限")
+                    image = None
+                if image:
+                    images = [image]
+                    break
+                logger.info(f"[群日报] 整图第 {attempt}/2 次渲染失败")
+        if not images:
+            parts = await render_report_image_banded(
                 archive,
                 stats,
                 analysis,
                 width=config.gdr_report_width,
                 style=config.gdr_report_style,
             )
-            if image:
-                images = [image]
-            else:
-                # 整图渲染失败（宿主帧大小上限/渲染器异常）时自动尝试分段
-                parts = await render_report_image_split(
-                    archive,
-                    stats,
-                    analysis,
-                    width=config.gdr_report_width,
-                    style=config.gdr_report_style,
+            if parts:
+                logger.info(
+                    f"[群日报] 分段/整图均超限，已改用像素带切片（{len(parts)} 块）"
                 )
-                if parts:
-                    logger.info("[群日报] 整图渲染失败，已自动改用分段渲染")
-                    images = parts
+                images = parts
         if images:
-            segments.extend(to_image_segment(img) for img in images)
+            poster_segs = [to_image_segment(img) for img in images]
+            for seg in poster_segs:
+                seg["poster"] = True  # 供发送层区分「海报图」与「漫画图」
+            segments.extend(poster_segs)
             logger.info(
                 f"[群日报] 群 {group_id} 海报渲染完成：{len(images)} 张，"
                 f"共 {sum(len(i) for i in images) // 1024}KB"
             )
         else:
-            # 静默降级会让人误以为「插件只输出文字」，所以明确告诉用户
-            logger.warning("[群日报] 海报渲染失败，降级为纯文字")
-            notices.append("海报渲染失败，本次只发文字版（详见日志）")
+            # 全部策略用尽——这时才退回文字，且发送层会保证文字版真的发出去
+            logger.warning("[群日报] 海报各档渲染策略均失败，降级为纯文字")
+            notices.append("海报渲染失败（已重试全部分块策略），本次只有文字版和漫画")
 
     # 只要漫画时，若漫画也没出来就没什么可发的了，不该再补一段正文
     if (with_comic or comic_only) and not image_model.available:

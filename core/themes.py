@@ -82,18 +82,31 @@ _DIM_COLORS = ("#ff9ec4", "#dcd3ff", "#9cc4e8", "#ffb3c6", "#b9a7e0", "#ff8eaa")
 
 # ── 渲染钩子（plugin.py 注入，包一层宿主 ctx.render.html2png）────────
 #
-# 签名：async (html: str, width: int) -> bytes | None（PNG 字节）。
-_HTML_RENDERER: Callable[[str, int], Awaitable[bytes | None]] | None = None
+# 签名：async (html: str, width: int, *, selector: str = "body") -> bytes | None。
+# selector 用于像素带切片（截页面指定区域）；旧钩子不认 selector 时自动退回整页。
+_HTML_RENDERER: Callable[..., Awaitable[bytes | None]] | None = None
+_HTML_SUPPORTS_SELECTOR = False
 
 
-def set_html_renderer(fn: Callable[[str, int], Awaitable[bytes | None]]) -> None:
+class RenderOversizeError(RuntimeError):
+    """渲染结果超过宿主 RPC 帧上限（16MB）——调用方应切块重试。"""
+
+
+def set_html_renderer(fn: Callable[..., Awaitable[bytes | None]]) -> None:
     """注册宿主渲染钩子（plugin.py 在 on_load 时调用）。
 
     Args:
-        fn: ``async (html, width) -> PNG bytes | None``。
+        fn: ``async (html, width, *, selector="body") -> PNG bytes | None``；
+            只接受 ``(html, width)`` 的旧钩子也可以，此时像素带切片不可用。
     """
-    global _HTML_RENDERER
+    global _HTML_RENDERER, _HTML_SUPPORTS_SELECTOR
     _HTML_RENDERER = fn
+    try:
+        import inspect
+
+        _HTML_SUPPORTS_SELECTOR = "selector" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        _HTML_SUPPORTS_SELECTOR = False
 
 
 def _env(directory: str):
@@ -651,6 +664,9 @@ async def _render_html(html: str, width: int, style: str) -> bytes | None:
     html = _inline_assets(html, style)
     try:
         return await _HTML_RENDERER(html, width)
+    except RenderOversizeError:
+        # 帧超限要让上层知道：好换分段/像素带策略重试，而不是当普通失败
+        raise
     except Exception as e:
         logger.error(f"[群日报] {style} 主题渲染失败: {e!s}")
         return None
@@ -839,3 +855,152 @@ async def render_theme_image_split(
         logger.info("[群日报] 分段脚本未生效（渲染器不执行脚本），退回整图")
         return None
     return [top, bottom]
+
+
+# ── 像素带自适应切片 ─────────────────────────────────────────────
+#
+# 动机：宿主 RPC 帧上限 16MB 是「渲染结果 PNG 的 base64」也绕不开的
+# 硬限制。消息量大的日子，整页海报原始 PNG 就能超过 ~12MB（base64
+# 后 16MB+），两分段也可能超。像素带方案把页面按高度切成 N 等份，
+# 每份单独截图成一张图，块数自适应翻倍直到每块都塞得进帧。
+#
+# 原理：往页面注入一个透明定位元素当「截图窗口」，用宿主渲染器的
+# ``selector`` 参数（元素区域截图）只截窗口覆盖的页面区域；
+# 页面总高由一个宽度=页面高度的 1px 探针元素量出（PNG 宽度即高度）。
+
+_PROBE_SNIPPET = """
+<div id="gdr-band-probe" style="position:absolute;left:0;top:0;height:1px;opacity:0;pointer-events:none;"></div>
+<script>(function(){
+  var d = document.getElementById('gdr-band-probe');
+  d.style.width = document.documentElement.scrollHeight + 'px';
+})();</script>
+"""
+
+_BAND_SNIPPET = """
+<div id="gdr-band" style="position:absolute;left:0;top:0;width:100%;height:__H__px;opacity:0;pointer-events:none;"></div>
+<script>(function(){
+  var b = document.getElementById('gdr-band');
+  // 自校准：无论定位祖先是谁，把窗口平移到目标文档坐标
+  var curX = b.getBoundingClientRect().left + (window.scrollX || 0);
+  var curY = b.getBoundingClientRect().top + (window.scrollY || 0);
+  b.style.left = (__X__ - curX) + 'px';
+  b.style.top = (__Y__ - curY) + 'px';
+})();</script>
+"""
+
+
+def _inject_before_body_close(html: str, snippet: str) -> str:
+    """把片段插到 ``</body>`` 前（此时 DOM 已解析完，脚本能立即量测）。"""
+    idx = html.lower().rfind("</body>")
+    return html[:idx] + snippet + html[idx:] if idx != -1 else html + snippet
+
+
+def _png_pixel_width(png: bytes) -> int:
+    """读 PNG IHDR 里的像素宽度（探针图宽度=页面文档高度）。"""
+    if len(png) < 24 or png[:8] != b"\x89PNG\r\n\x1a\n":
+        return 0
+    import struct
+
+    return struct.unpack(">I", png[16:20])[0]
+
+
+async def _render_selector(html: str, width: int, selector: str) -> bytes | None:
+    """带 selector 的渲染；钩子不支持 selector 时返回 ``None``。"""
+    if not (_HTML_RENDERER and _HTML_SUPPORTS_SELECTOR):
+        return None
+    return await _HTML_RENDERER(html, width, selector=selector)
+
+
+async def render_theme_image_banded(
+    archive: Any,
+    stats: Any,
+    analysis: dict[str, Any],
+    *,
+    style: str = "scrapbook",
+    width: int = 900,
+    start_bands: int = 4,
+    max_bands: int = 32,
+) -> list[bytes] | None:
+    """把整页海报按高度切成 N 等份渲染，帧超限自动翻倍块数重试。
+
+    与 :func:`render_theme_image_split` 的语义切点不同，这是纯像素切分，
+    不依赖主题结构，任意主题/任意页高都适用；代价是切缝可能落在文字
+    行中间——所以它只作为语义分段和整图都超限时的最后手段。
+
+    Args:
+        archive/stats/analysis: 同 :func:`render_theme_image`。
+        style: 主题名。
+        width: 渲染宽度。
+        start_bands: 起始块数。
+        max_bands: 块数上限（防无限翻倍）。
+
+    Returns:
+        N 张 PNG（按文档顺序）；探针量高失败、钩子不支持 selector 或
+        到达块数上限仍超限时返回 ``None``。
+    """
+    built = await _build_theme_context(style, archive, stats, analysis)
+    if built is None:
+        return None
+    ctx, directory = built
+    try:
+        html = await _env(directory).get_template("image_template.html").render_async(
+            **ctx
+        )
+    except Exception as e:
+        logger.error(f"[群日报] {style} 主题模板渲染失败: {e!s}")
+        return None
+    html = _inline_assets(html, directory)
+
+    # 1) 探针：1px 高、宽度=文档总高的透明元素，PNG 宽度即页高
+    try:
+        probe = await _render_selector(
+            _inject_before_body_close(html, _PROBE_SNIPPET), width, "#gdr-band-probe"
+        )
+    except RenderOversizeError:
+        probe = None
+    if not probe:
+        logger.info("[群日报] 渲染钩子不支持区域截图，像素带切片不可用")
+        return None
+    page_h = _png_pixel_width(probe)
+    if page_h <= 0:
+        logger.warning(f"[群日报] 探针量高失败（PNG 宽度解析为 0），像素带切片不可用")
+        return None
+
+    # 2) 逐块截图；任何一块帧超限就把块数翻倍从头来
+    n = max(2, start_bands)
+    while n <= max_bands:
+        band_h = -(-page_h // n)  # 向上取整
+        images: list[bytes] = []
+        oversize = False
+        for i in range(n):
+            top = i * band_h
+            h = min(band_h, page_h - top)
+            if h <= 0:
+                break
+            snippet = (
+                _BAND_SNIPPET.replace("__H__", str(h))
+                .replace("__X__", "0")
+                .replace("__Y__", str(top))
+            )
+            try:
+                png = await _render_selector(
+                    _inject_before_body_close(html, snippet), width, "#gdr-band"
+                )
+            except RenderOversizeError:
+                oversize = True
+                break
+            if not png:
+                return None
+            images.append(png)
+        if not oversize and images:
+            logger.info(
+                f"[群日报] 像素带切片成功：页高 {page_h}px ÷ {n} 块，"
+                f"共 {sum(len(p) for p in images) // 1024}KB"
+            )
+            return images
+        if n == max_bands:
+            break
+        n = min(n * 2, max_bands)
+        logger.info(f"[群日报] 像素带超限，加密到 {n} 块重试")
+    logger.error(f"[群日报] 像素带切片失败：{max_bands} 块仍超限（页高 {page_h}px）")
+    return None
