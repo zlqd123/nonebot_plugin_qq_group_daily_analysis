@@ -395,6 +395,36 @@ def _quality(quality: Any) -> dict[str, Any]:
     }
 
 
+def _theme_render_env(style: str) -> tuple[dict[str, Any], str, Any, dict[str, Any]] | None:
+    """取主题的渲染环境：模板入参配置、目录、jinja 环境、子模板公共变量。
+
+    Args:
+        style: 主题名，见 :data:`REPORT_STYLES`。
+
+    Returns:
+        ``(conf, directory, env, frag_ctx)``；主题未知返回 ``None``。
+    """
+    conf = _THEMES.get(style)
+    if conf is None:
+        logger.warning(f"[群日报] 未知海报主题 {style!r}")
+        return None
+    directory = style
+    env = _env(directory)
+    # 子模板同样可能引用 mirror 变量，**必须和主模板拿到同一份**。
+    # 漏传时 Jinja 把未定义变量渲染成空串，于是
+    # ``{{ t2i_atri_font_mirror }}/file/x.gif`` 变成 ``/file/x.gif``——
+    # 文件系统根目录的绝对路径，图片必然裂，而且不报错。
+    # ATRI 的 quote_item / user_title_item 正是这么写的。
+    frag_ctx: dict[str, Any] = {
+        **_FONT_MIRRORS,
+        "t2i_font_source": _FONT_SOURCE,
+        **conf.get("extra", {}),
+    }
+    if local := conf.get("local_mirror"):
+        frag_ctx[local] = "."
+    return conf, directory, env, frag_ctx
+
+
 async def _build_theme_context(
     style: str,
     archive: Any,
@@ -416,26 +446,10 @@ async def _build_theme_context(
     Returns:
         ``(模板入参, 主题目录名)``；主题未知时返回 ``None``。
     """
-    conf = _THEMES.get(style)
-    if conf is None:
-        logger.warning(f"[群日报] 未知海报主题 {style!r}")
+    resolved = _theme_render_env(style)
+    if resolved is None:
         return None
-
-    directory = style
-    env = _env(directory)
-
-    # 子模板同样可能引用 mirror 变量，**必须和主模板拿到同一份**。
-    # 漏传时 Jinja 把未定义变量渲染成空串，于是
-    # ``{{ t2i_atri_font_mirror }}/file/x.gif`` 变成 ``/file/x.gif``——
-    # 文件系统根目录的绝对路径，图片必然裂，而且不报错。
-    # ATRI 的 quote_item / user_title_item 正是这么写的。
-    frag_ctx: dict[str, Any] = {
-        **_FONT_MIRRORS,
-        "t2i_font_source": _FONT_SOURCE,
-        **conf.get("extra", {}),
-    }
-    if local := conf.get("local_mirror"):
-        frag_ctx[local] = "."
+    conf, directory, env, frag_ctx = resolved
 
     chart = ""
     if any(stats.hourly):
@@ -1004,3 +1018,219 @@ async def render_theme_image_banded(
         logger.info(f"[群日报] 像素带超限，加密到 {n} 块重试")
     logger.error(f"[群日报] 像素带切片失败：{max_bands} 块仍超限（页高 {page_h}px）")
     return None
+
+
+# ── 卡片分页渲染 ─────────────────────────────────────────────────
+#
+# 用户可见的切分方式：每张图只渲染约两个卡片（话题/金句/名片条目），
+# 永不把一张卡片拦腰切断。实现上**不往卡片流里注任何 DOM**——那会
+# 干扰 .html-slot 上的 nth-child 斑马纹——而是每张图用独立上下文渲染：
+# 不参与的列表 fragment 传空串，模板的 {% if %} 让整个 section 消失；
+# 再用一对零尺寸定位标记 + 隐藏脚本裁掉页首（hero/统计）与页脚。
+
+_CARD_MARK_STYLE = "position:absolute;left:0;width:0;height:0;overflow:hidden"
+
+_HIDE_OUTSIDE_JS = """
+  const hide = (el) => { el.style.display = 'none'; };
+  const hideBefore = (m) => {
+    const list = [];
+    let node = m;
+    while (node && node !== document.documentElement) {
+      let sib = node.previousElementSibling;
+      while (sib) { list.push(sib); sib = sib.previousElementSibling; }
+      node = node.parentElement;
+    }
+    list.forEach(hide);
+    hide(m);
+    // 头部容器清理：藏完后只剩题头、再无「标记之后」可见内容的容器一并藏掉
+    let p = m.parentElement;
+    while (p && p !== document.body) {
+      const hasAfter = Array.from(p.querySelectorAll('*')).some(
+        (c) => c !== m && c.style.display !== 'none' &&
+        (m.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING)
+      );
+      if (hasAfter) break;
+      hide(p);
+      p = p.parentElement;
+    }
+  };
+  const hideAfter = (m) => {
+    const list = [];
+    let node = m;
+    while (node && node !== document.documentElement) {
+      let sib = node.nextElementSibling;
+      while (sib) { list.push(sib); sib = sib.nextElementSibling; }
+      node = node.parentElement;
+    }
+    list.forEach(hide);
+    hide(m);
+  };
+  const from = document.getElementById('__FROM__');
+  const to = document.getElementById('__TO__');
+  if (from) hideBefore(from);
+  if (to) hideAfter(to);
+"""
+
+
+def _hide_outside_html(html: str, from_id: str, to_id: str) -> str:
+    """注入裁剪脚本：隐藏 ``from_id`` 之前与 ``to_id`` 之后的所有内容。
+
+    两个标记都可以为空串（表示该侧不裁）。脚本插在 ``</body>`` 前，
+    DOM 解析完毕后立即执行——与宿主渲染器的截图时机关系同 _split_html。
+    """
+    body = _HIDE_OUTSIDE_JS.replace("__FROM__", from_id).replace("__TO__", to_id)
+    script = f"<script>(function() {{ {body} }})();</script>"
+    idx = html.lower().rfind("</body>")
+    return html[:idx] + script + html[idx:] if idx != -1 else html + script
+
+
+def _card_marker(marker_id: str) -> str:
+    """生成零尺寸定位标记（不参与布局，仅作隐藏脚本的定位锚点）。"""
+    return f'<i id="{marker_id}" style="{_CARD_MARK_STYLE}"></i>'
+
+
+async def render_theme_image_cards(
+    archive: Any,
+    stats: Any,
+    analysis: dict[str, Any],
+    *,
+    style: str = "scrapbook",
+    width: int = 900,
+    per_page: int = 2,
+    max_pages: int = 8,
+) -> list[bytes] | None:
+    """按卡片粒度把海报拆成多张图，每张约 ``per_page`` 个条目卡片。
+
+    与 :func:`render_theme_image_split`（固定上下两段）不同，这里把
+    话题/金句/名片条目按 ``per_page`` 个一组拆成多页：首页带 hero、
+    统计与活跃图表，中间每页一个 section 的若干卡片（section 题头
+    一并裁掉），末页放锐评与页脚。切缝永远落在卡片之间。
+
+    页数超过 ``max_pages`` 时自动增大每页卡片数，避免刷屏；某页渲染
+    超宿主帧上限时自动降为每页 1 个卡片重试，仍超限则放弃本方案
+    （调用方继续走像素带切片兜底）。
+
+    Returns:
+        按文档顺序的 PNG 列表；没有可拆的卡片、渲染钩子缺失或各档
+        尝试都失败时返回 ``None``。
+    """
+    built = await _build_theme_context(style, archive, stats, analysis)
+    if built is None:
+        return None
+    ctx0, directory = built
+    resolved = _theme_render_env(style)
+    if resolved is None:
+        return None
+    _conf, _dir, env, frag_ctx = resolved
+    if _HTML_RENDERER is None:
+        return None
+
+    topics = _topics(analysis.get("topics"))
+    quotes = _quotes(analysis.get("quotes"))
+    titles = _titles(analysis.get("titles"))
+    quality_html = str(ctx0.get("chat_quality_html") or "")
+    card_sections = (
+        ("topics_html", "topic_item.html", "topics", topics),
+        ("quotes_html", "quote_item.html", "quotes", quotes),
+        ("titles_html", "user_title_item.html", "titles", titles),
+    )
+    if not any(items for _, _, _, items in card_sections) and not quality_html:
+        return None
+
+    async def _chunk(tpl: str, list_var: str, items: list[Any], lo: int, hi: int) -> str:
+        return await _frag(env, tpl, **{list_var: items[lo:hi]}, **frag_ctx)
+
+    def _count_pages(pp: int) -> int:
+        n = 1  # 首页
+        for _, _, _, items in card_sections:
+            rest = max(0, len(items) - pp)  # 首页已带第一个 chunk
+            n += -(-rest // pp) if items else 0
+        if quality_html:
+            n += 1
+        return n
+
+    pp = max(1, per_page)
+    longest = max((len(i) for _, _, _, i in card_sections if i), default=1)
+    while _count_pages(pp) > max_pages and pp < longest:
+        pp += 1
+    if pp != per_page:
+        logger.info(f"[群日报] 卡片分页 {per_page}/页会超 {max_pages} 张，自动改为 {pp}/页")
+
+    from_base = "gdr-card-from"
+    to_base = "gdr-card-to"
+
+    async def _render_page(ctx: dict[str, Any], from_id: str = "", to_id: str = "") -> bytes:
+        html = await _env(directory).get_template("image_template.html").render_async(**ctx)
+        html = _inline_assets(html, directory)
+        if from_id or to_id:
+            html = _hide_outside_html(html, from_id, to_id)
+        return await _HTML_RENDERER(html, width)
+
+    images: list[bytes] = []
+    for attempt_pp in (pp, 1):  # 超帧上限时降为每页 1 卡重试
+        images = []
+        try:
+            # 首页：hero + 统计 + 图表 + 第一个 section 的前 pp 张卡
+            ctx = {**ctx0}
+            for key, _, _, _ in card_sections:
+                ctx[key] = ""
+            ctx["chat_quality_html"] = ""
+            head_marker = ""
+            for key, tpl, list_var, items in card_sections:
+                if items:
+                    chunk = await _chunk(tpl, list_var, items, 0, min(pp, len(items)))
+                    ctx[key] = chunk + _card_marker(f"{to_base}-head")
+                    images.append(await _render_page(ctx, to_id=f"{to_base}-head"))
+                    break
+            else:
+                images.append(await _render_page(ctx))
+
+            # 中间页：每个 section 剩余卡片按 pp 一组，只渲染该组
+            for key, tpl, list_var, items in card_sections:
+                for lo in range(pp, len(items), pp):
+                    ctx = {**ctx0}
+                    for k, _, _, _ in card_sections:
+                        ctx[k] = ""
+                    ctx["chat_quality_html"] = ""
+                    ctx["hourly_chart_html"] = ""
+                    chunk = await _chunk(tpl, list_var, items, lo, min(lo + pp, len(items)))
+                    ctx[key] = (
+                        _card_marker(f"{from_base}-{key}-{lo}")
+                        + chunk
+                        + _card_marker(f"{to_base}-{key}-{lo}")
+                    )
+                    images.append(
+                        await _render_page(
+                            ctx,
+                            from_id=f"{from_base}-{key}-{lo}",
+                            to_id=f"{to_base}-{key}-{lo}",
+                        )
+                    )
+
+            # 末页：锐评 + 页脚
+            if quality_html:
+                ctx = {**ctx0}
+                for key, _, _, _ in card_sections:
+                    ctx[key] = ""
+                ctx["hourly_chart_html"] = ""
+                ctx["chat_quality_html"] = _card_marker(f"{from_base}-quality") + quality_html
+                images.append(await _render_page(ctx, from_id=f"{from_base}-quality"))
+            return images
+        except RenderOversizeError:
+            if attempt_pp == 1:
+                logger.warning("[群日报] 卡片分页每页 1 卡仍超帧上限，放弃本方案")
+                return None
+            logger.info("[群日报] 卡片分页超帧上限，降为每页 1 卡重试")
+        except Exception as e:
+            logger.error(f"[群日报] 卡片分页渲染失败: {e!s}")
+            return None
+    return None
+
+
+def _card_section_tpl(key: str) -> tuple[str, str]:
+    """fragment 键 -> (子模板文件名, 列表变量名)。"""
+    return {
+        "topics_html": ("topic_item.html", "topics"),
+        "quotes_html": ("quote_item.html", "quotes"),
+        "titles_html": ("user_title_item.html", "titles"),
+    }[key]

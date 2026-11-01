@@ -24,6 +24,7 @@ from .themes import (
     clean_topics,
     render_theme_image,
     render_theme_image_banded,
+    render_theme_image_cards,
     render_theme_image_split,
 )
 
@@ -78,6 +79,37 @@ async def render_report_image(
     return await render_theme_image(
         archive, stats, analysis, style=_safe_style(style), width=width
     )
+
+
+async def render_report_image_cards(
+    archive: ChatArchive,
+    stats: ChatStats,
+    analysis: dict[str, Any],
+    *,
+    width: int = 900,
+    style: str = "scrapbook",
+    per_page: int = 2,
+) -> list[bytes] | None:
+    """把日报按卡片粒度拆成多张海报图（每张约 ``per_page`` 个卡片）。
+
+    切缝永远落在卡片之间，不会截断文字；详见
+    :func:`themes.render_theme_image_cards`。
+
+    Returns:
+        PNG 列表；无卡片可拆、钩子缺失或各档尝试失败时返回 ``None``。
+    """
+    try:
+        return await render_theme_image_cards(
+            archive,
+            stats,
+            analysis,
+            style=_safe_style(style),
+            width=width,
+            per_page=per_page,
+        )
+    except RenderOversizeError:
+        # cards 内部已消化超限；兜底不让异常逃出编排层
+        return None
 
 
 async def render_report_image_split(

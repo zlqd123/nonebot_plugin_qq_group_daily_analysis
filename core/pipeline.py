@@ -30,6 +30,7 @@ from .report import (
     build_text_summary,
     render_report_image,
     render_report_image_banded,
+    render_report_image_cards,
     render_report_image_split,
     to_image_segment,
 )
@@ -442,10 +443,23 @@ async def generate_daily_report(
             f"[群日报] 群 {group_id} 开始渲染海报：主题 {config.gdr_report_style}，"
             f"宽 {config.gdr_report_width}px"
         )
-        # 渲染策略链：语义分段 → 整图（重试一次）→ 像素带自适应切片
-        # （4→8→16→32 块，帧超限自动翻倍）。宿主 16MB RPC 帧上限卡的是
-        # 渲染结果本身，所以「发不出图」只能靠切块重试解决，不降级文字。
-        if config.gdr_split_report:
+        # 渲染策略链：卡片分页（每张约 N 个卡片，切缝不截断文字）→
+        # 语义分段 → 整图（重试一次）→ 像素带自适应切片（4→8→16→32 块，
+        # 帧超限自动翻倍）。宿主 16MB RPC 帧上限卡的是渲染结果本身，
+        # 所以「发不出图」只能靠切块重试解决，不降级文字。
+        if config.gdr_cards_per_image > 0:
+            parts = await render_report_image_cards(
+                archive,
+                stats,
+                analysis,
+                width=config.gdr_report_width,
+                style=config.gdr_report_style,
+                per_page=config.gdr_cards_per_image,
+            )
+            if parts:
+                logger.info(f"[群日报] 卡片分页渲染成功：{len(parts)} 张")
+                images = parts
+        if not images and config.gdr_split_report:
             parts = await render_report_image_split(
                 archive,
                 stats,

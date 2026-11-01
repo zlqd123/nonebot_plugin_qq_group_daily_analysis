@@ -298,6 +298,13 @@ class GdrConfig:
         return bool(_get(self._c, "report.split_report", False))
 
     @property
+    def gdr_cards_per_image(self) -> int:
+        try:
+            return int(_get(self._c, "report.cards_per_image", 2) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @property
     def gdr_enable_text_summary(self) -> bool:
         return bool(_get(self._c, "report.enable_text_summary", True))
 

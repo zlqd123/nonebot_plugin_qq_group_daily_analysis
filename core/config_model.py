@@ -270,6 +270,15 @@ class ReportSection(PluginConfigBase):
         ),
     )
     width: int = Field(default=900, description="日报海报渲染宽度（像素）")
+    cards_per_image: int = Field(
+        default=2,
+        description=(
+            "每张海报图最多渲染几个条目卡片（话题/金句/名片），0=关闭。"
+            "开启后长海报按卡片拆成多张图发送，切缝永远落在卡片之间，"
+            "不会截断文字；首页带统计图表，末页带锐评和页脚，"
+            "总张数超 8 时自动增大每页卡片数"
+        ),
+    )
     split_report: bool = Field(
         default=False,
         description=(
@@ -467,6 +476,7 @@ _apply_zh_labels(ReportSection, {
     "style": ("海报主题", "6 套 astrbot 原版主题任选"),
     "width": ("海报宽度（像素）", "渲染宽度，默认 900"),
     "split_report": ("分段发送", "海报过长切上下两段；依赖宿主渲染器执行脚本，不可用自动退回整图"),
+    "cards_per_image": ("每图卡片数", "按卡片拆分海报（每张约 N 个卡片，0=关闭）；卡片不会被截断，推荐 2"),
     "enable_text_summary": ("附带文字总结", "both 模式下海报之外是否再发纯文字版"),
     "send_text": ("额外发文字版", "海报已含全部内容，再发是重复刷屏；告警不受此开关限制"),
     "prompt_style": ("点评语气", "roast=毒舌锐评 / warm=温和 / neutral=中性 / custom=自定义"),
