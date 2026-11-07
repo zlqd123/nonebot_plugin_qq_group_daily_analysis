@@ -41,6 +41,10 @@ class Config(BaseModel, extra="ignore"):
     gdrq_text_timeout: int = 300
     gdrq_max_tokens: int = 0
     """输出上限，0 = 不发送该字段由服务端决定。"""
+    gdrq_text_thinking: str = ""
+    """思维链开关（mimo 等 OpenAI 兼容接口的 ``thinking`` 参数）：
+    空 = 不发送该字段（走模型默认）；``enabled`` / ``disabled`` = 显式指定。
+    注意思考模式下 reasoning_content 会作为正文回落来源。"""
 
     # ── 分析参数 ────────────────────────────────────────────────
     gdrq_max_topics: int = 12

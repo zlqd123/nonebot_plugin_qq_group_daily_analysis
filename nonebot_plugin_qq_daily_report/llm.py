@@ -108,6 +108,10 @@ class TextModel:
         }
         if cfg.gdrq_max_tokens > 0:
             payload["max_tokens"] = cfg.gdrq_max_tokens
+        # 思维链开关（mimo v2.6 等）：默认不发送走模型默认；
+        # 思考模式下 temperature/top_p 会被服务端忽略，本插件本就不发这两个
+        if cfg.gdrq_text_thinking.strip().lower() in ("enabled", "disabled"):
+            payload["thinking"] = {"type": cfg.gdrq_text_thinking.strip().lower()}
         return url, headers, payload
 
     @staticmethod
