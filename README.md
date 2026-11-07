@@ -2,6 +2,12 @@
 
 # 群日报 · NoneBot 版
 
+> **目录说明**：[`nonebot_plugin_qq_group_daily_analysis/`](nonebot_plugin_qq_group_daily_analysis/)
+> 是 OneBot v11 版（NapCat 等实现，历史消息回溯采集）；
+> [`nonebot_plugin_qq_daily_report/`](nonebot_plugin_qq_daily_report/)
+> 是 **QQ 官方机器人版**（adapter-qq，全量群消息实时落库，无历史接口，
+> 海报经分片上传 + markdown 卡片发送），详见其目录内 README。
+
 [![NoneBot](https://img.shields.io/badge/NoneBot2-2.x-4e5f95?style=for-the-badge&logo=nonebot&logoColor=white)](https://nonebot.dev)
 [![OneBot V11](https://img.shields.io/badge/适配-OneBot%20V11-3b82f6?style=for-the-badge)](https://github.com/botuniverse/onebot-11)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776ab?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
