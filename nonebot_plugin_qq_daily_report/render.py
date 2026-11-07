@@ -514,6 +514,45 @@ def _safe_style(style: str) -> str:
 # ── 截图 ───────────────────────────────────────────────────────
 
 
+async def _render_html_to_pic(
+    directory: str, ctx: dict[str, Any], width: int
+) -> bytes:
+    """HTML → PNG：按 ``GDRQ_RENDER_BACKEND`` 选择渲染通道。
+
+    auto：优先 htmlrender 的 ``template_to_pic``（0.7.x 老 API，
+    bison5 环境）；ImportError / 渲染失败时回落直连 chromium CDP
+    （bison2 环境）。资源 URL 都是本插件静态路由的绝对地址，
+    两条通道通用。
+    """
+    backend = os.environ.get("GDRQ_RENDER_BACKEND", "auto").strip().lower()
+    if backend in ("auto", "htmlrender"):
+        try:
+            from nonebot import require
+
+            require("nonebot_plugin_htmlrender")
+            from nonebot_plugin_htmlrender import template_to_pic
+
+            return await template_to_pic(
+                template_path=str(THEME_DIR / directory),
+                template_name="image_template.html",
+                templates=ctx,
+                pages={"viewport": {"width": width, "height": 10}},
+            )
+        except ImportError:
+            if backend == "htmlrender":
+                raise
+            logger.info("[群日报] htmlrender 无 template_to_pic（0.8+），走 CDP")
+        except Exception as e:
+            if backend == "htmlrender":
+                raise
+            logger.warning(f"[群日报] htmlrender 渲染失败，回落 CDP: {e!s}")
+
+    html = await _env(directory).get_template("image_template.html").render_async(
+        **ctx
+    )
+    return await _screenshot(html, width)
+
+
 async def _screenshot(html: str, width: int) -> bytes:
     """连接 chromium CDP 渲染 HTML 并整页截图；不关共享的 browser 连接。
 
@@ -557,10 +596,7 @@ async def render_report_image(
     ctx, directory = built
 
     try:
-        html = await _env(directory).get_template("image_template.html").render_async(
-            **ctx
-        )
-        return await _screenshot(html, width)
+        return await _render_html_to_pic(directory, ctx, width)
     except Exception as e:
         logger.error(f"[群日报] {style} 主题渲染失败: {e!s}")
         return None

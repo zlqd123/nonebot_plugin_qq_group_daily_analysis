@@ -45,6 +45,18 @@ CREATE TABLE IF NOT EXISTS groups (
 );
 """
 
+
+def _migrate(conn: Any) -> None:
+    """升级旧库：补 source 列（'qq' = 官方机器人实时落库，
+    'onebot' = OneBot 实时落库；历史接口采集不落库）。"""
+    cursor = conn.execute("PRAGMA table_info(messages)")
+    cols = {row[1] for row in cursor.fetchall()}
+    if "source" not in cols:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN source TEXT NOT NULL DEFAULT 'qq'"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_source_ts ON messages(source, ts)")
+
 _db_path: Path | None = None
 _lock = asyncio.Lock()
 
@@ -59,6 +71,7 @@ def init(cache_dir: str) -> Path:
 
     with sqlite3.connect(str(_db_path)) as conn:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
     return _db_path
 
 
@@ -75,29 +88,35 @@ async def insert_message(
     text: str,
     emoji_count: int,
     ts: int,
+    source: str = "qq",
 ) -> None:
-    """写入一条消息。"""
+    """写入一条消息。source: 'qq' 官方机器人 / 'onebot' OneBot 实时落库。"""
     async with _lock:
         async with aiosqlite.connect(str(_require_path())) as db:
             await db.execute(
                 "INSERT INTO messages(group_openid, member_openid, nickname,"
-                " text, emoji_count, ts) VALUES (?,?,?,?,?,?)",
-                (group_openid, member_openid, nickname, text, emoji_count, ts),
+                " text, emoji_count, ts, source) VALUES (?,?,?,?,?,?,?)",
+                (group_openid, member_openid, nickname, text, emoji_count, ts, source),
             )
             await db.commit()
 
 
 async def fetch_messages(
-    group_openid: str, start_ts: int, end_ts: int, limit: int = 20000
+    group_openid: str,
+    start_ts: int,
+    end_ts: int,
+    limit: int = 20000,
+    source: str = "qq",
 ) -> list[ChatMessage]:
     """取窗口内的消息，按时间升序。"""
     async with aiosqlite.connect(str(_require_path())) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT member_openid, nickname, text, emoji_count, ts"
-            " FROM messages WHERE group_openid = ? AND ts BETWEEN ? AND ?"
+            " FROM messages WHERE group_openid = ? AND source = ?"
+            " AND ts BETWEEN ? AND ?"
             " ORDER BY ts ASC LIMIT ?",
-            (group_openid, start_ts, end_ts, limit),
+            (group_openid, source, start_ts, end_ts, limit),
         )
         rows = await cursor.fetchall()
     return [
@@ -112,13 +131,15 @@ async def fetch_messages(
     ]
 
 
-async def count_messages(group_openid: str, start_ts: int, end_ts: int) -> int:
+async def count_messages(
+    group_openid: str, start_ts: int, end_ts: int, source: str = "qq"
+) -> int:
     """窗口内消息总数（含空昵称等，用于数据量判断）。"""
     async with aiosqlite.connect(str(_require_path())) as db:
         cursor = await db.execute(
             "SELECT COUNT(*) FROM messages"
-            " WHERE group_openid = ? AND ts BETWEEN ? AND ?",
-            (group_openid, start_ts, end_ts),
+            " WHERE group_openid = ? AND source = ? AND ts BETWEEN ? AND ?",
+            (group_openid, source, start_ts, end_ts),
         )
         row = await cursor.fetchone()
     return int(row[0]) if row else 0
@@ -155,7 +176,7 @@ async def save_member(group_openid: str, member_openid: str, username: str) -> N
             await db.commit()
 
 
-async def backfill_nicknames(group_openid: str) -> int:
+async def backfill_nicknames(group_openid: str, source: str = "qq") -> int:
     """用成员缓存回填历史消息里的空昵称，返回更新的行数。"""
     async with _lock:
         async with aiosqlite.connect(str(_require_path())) as db:
@@ -164,11 +185,11 @@ async def backfill_nicknames(group_openid: str) -> int:
                 "  SELECT m.username FROM members m"
                 "  WHERE m.group_openid = messages.group_openid"
                 "    AND m.member_openid = messages.member_openid)"
-                " WHERE group_openid = ? AND nickname = ''"
+                " WHERE group_openid = ? AND source = ? AND nickname = ''"
                 "   AND EXISTS (SELECT 1 FROM members m"
                 "              WHERE m.group_openid = messages.group_openid"
                 "                AND m.member_openid = messages.member_openid)",
-                (group_openid,),
+                (group_openid, source),
             )
             await db.commit()
             return cursor.rowcount or 0

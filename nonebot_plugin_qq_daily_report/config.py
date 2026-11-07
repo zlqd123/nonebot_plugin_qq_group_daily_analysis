@@ -11,10 +11,14 @@ from pydantic import BaseModel, Field
 
 
 class GroupSchedule(BaseModel):
-    """单个群的定时推送配置。"""
+    """单个群的定时推送配置（二选一：group_id = OneBot 群号，
+    group_openid = QQ 官方机器人群 openid）。"""
 
-    group_openid: str
-    """群的 openid（群里 @机器人 发 iinfo 可查）。"""
+    group_openid: str = ""
+    """官方机器人视角的群 openid。"""
+
+    group_id: int | None = None
+    """OneBot 视角的群号。"""
 
     time: str = "21:00"
     """24 小时制 HH:MM。"""
@@ -56,7 +60,11 @@ class Config(BaseModel, extra="ignore"):
     # ── 输出 ───────────────────────────────────────────────────
     gdrq_report_width: int = 900
     gdrq_report_style: str = "scrapbook"
-    """海报主题，目前仅移植了 scrapbook。"""
+    """海报主题：scrapbook / atri。"""
+    gdrq_render_backend: str = "auto"
+    """auto：优先 htmlrender 的 template_to_pic（旧版 0.7.x 可用），
+    失败回落直连 chromium CDP（SD_CDP_HOST/PORT）；cdp：强制 CDP；
+    htmlrender：强制 htmlrender。"""
     gdrq_split_report: bool = False
     """海报过长时分上下两段发送（各自独立分片上传）。"""
     gdrq_send_text: bool = False

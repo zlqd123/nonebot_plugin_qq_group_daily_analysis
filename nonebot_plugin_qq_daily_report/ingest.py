@@ -56,6 +56,7 @@ async def _record(event: GroupMessageCreateEvent) -> None:
             text=text,
             emoji_count=emoji_count,
             ts=ts,
+            source="qq",
         )
     except Exception:
         logger.exception("[群日报] 消息落库失败")

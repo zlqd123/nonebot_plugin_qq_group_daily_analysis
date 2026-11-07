@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
-"""QQ 官方机器人群聊日报插件。
+"""群聊日报插件（二合一：OneBot v11 / QQ 官方机器人，自动检测）。
 
-官方机器人没有群历史消息接口，本插件以「实时落库」为数据来源：
-群内全量消息（GROUP_MESSAGE_CREATE）实时写入 SQLite（仅文本，
-默认保留 72h），日报生成时查库 → LLM 结构化分析 → scrapbook 主题
-海报渲染 → sd_media 分片上传 → markdown 卡片发送。
+同一份代码，按群所属适配器自动选择通道：
 
-移植自 bison5 的 ``nonebot_plugin_qq_group_daily_analysis``（OneBot v11 版）。
+- **OneBot v11**（NapCat 等）：``get_group_msg_history`` 按时间回溯采集
+  （可回补离线时段），海报 base64 段直接发送；实时消息也落库兜底。
+- **QQ 官方机器人**（adapter-qq）：无历史接口，全量群消息
+  （GROUP_MESSAGE_CREATE）实时落库为唯一来源；海报经分片上传
+  （raw_url）拼 markdown 卡片发送。
+
+渲染通道自动选择：htmlrender 的 ``template_to_pic``（0.7.x，bison5 类
+环境）→ 失败回落直连 chromium CDP（bison2 环境，``SD_CDP_HOST/PORT``）。
+
+移植自 bison5 的 ``nonebot_plugin_qq_group_daily_analysis``（OneBot 版）。
 """
 
 from __future__ import annotations
@@ -15,23 +21,29 @@ import asyncio
 from datetime import datetime
 from typing import Any
 
-import httpx
 from nonebot import get_bots, get_driver, get_plugin_config, on_command
 from nonebot.adapters import Event
-from nonebot.adapters.qq import Bot as QqBot
-from nonebot.adapters.qq import GroupMessageCreateEvent
 from nonebot.log import logger
 from nonebot.rule import Rule
 
 from . import store
 from .config import Config
 from .llm import TextModel
-from .pipeline import Payload, generate_daily_report
+from .pipeline import generate_daily_report
+from .send import Report, send_official, send_onebot
+
+try:  # OneBot 适配器是可选依赖
+    from nonebot.adapters.onebot.v11 import Bot as Ob11Bot
+    from nonebot.adapters.onebot.v11 import GroupMessageEvent as Ob11GroupEvent
+except ImportError:  # pragma: no cover
+    Ob11Bot = None  # type: ignore[assignment,misc]
+    Ob11GroupEvent = None  # type: ignore[assignment,misc]
+
+from nonebot.adapters.qq import Bot as QqBot  # noqa: E402
+from nonebot.adapters.qq import GroupMessageCreateEvent  # noqa: E402
 
 plugin_config = get_plugin_config(Config)
 text_model = TextModel(plugin_config)
-
-API = "https://api.sgroup.qq.com"
 
 driver = get_driver()
 
@@ -42,69 +54,43 @@ async def _init_store() -> None:
     logger.info(f"[群日报] 落库已就绪: {path}")
 
 
-# 消息采集（导入即注册监听器）
+# 消息采集：官方 WS 全量 + OneBot 实时兜底（导入即注册）
 from . import ingest as _ingest  # noqa: E402,F401
+from . import ingest_ob11 as _ingest_ob11  # noqa: E402,F401
+
+
+# ── Bot 查找 ───────────────────────────────────────────────────
+
+
+def _find_ob11_bot() -> Any | None:
+    if Ob11Bot is None:
+        return None
+    for b in get_bots().values():
+        if isinstance(b, Ob11Bot):
+            return b
+    return None
+
+
+def _find_qq_bot() -> QqBot | None:
+    for b in get_bots().values():
+        if isinstance(b, QqBot):
+            return b
+    return None
 
 
 # ── 发送 ───────────────────────────────────────────────────────
 
 
-async def _post_group_message(
-    bot: QqBot, group_openid: str, body: dict[str, Any]
+async def deliver(
+    channel: str, bot: Any, group: str | int, report: Report, msg_id: str | None = None
 ) -> None:
-    """裸 HTTP 发群消息。
-
-    不走 adapter 的 ``send_to_group``：bison_qq_patch 的实测表明，
-    adapter 会强附 ``timestamp`` 字段触发 40034024，而裸 HTTP + token
-    （``bot.get_access_token()`` 自带缓存续期）是已验证的稳定通道。
-    """
-    token = await bot.get_access_token()
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(
-            f"{API}/v2/groups/{group_openid}/messages",
-            json=body,
-            headers={"Authorization": f"QQBot {token}"},
+    """按通道发送日报。"""
+    if channel == "onebot":
+        await send_onebot(bot, int(group), report)  # type: ignore[arg-type]
+    else:
+        await send_official(
+            bot, str(group), report, msg_id=msg_id, img_size=plugin_config.gdrq_img_size
         )
-        if r.status_code >= 400:
-            raise RuntimeError(
-                f"群消息发送失败 {r.status_code}: {r.text[:150]}"
-            )
-
-
-async def send_payloads(
-    bot: QqBot,
-    group_openid: str,
-    payloads: list[Payload],
-    *,
-    msg_id: str | None = None,
-) -> None:
-    """逐条发送日报内容段；被动回复（有 msg_id）时 msg_seq 递增。"""
-    seq = 0
-    for p in payloads:
-        seq += 1
-        if p.kind == "markdown":
-            body: dict[str, Any] = {
-                "msg_type": 2,
-                "markdown": {"content": p.content},
-            }
-        else:
-            body = {"msg_type": 0, "content": p.content}
-        if msg_id:
-            body["msg_id"] = msg_id
-            body["msg_seq"] = seq
-        try:
-            await _post_group_message(bot, group_openid, body)
-        except Exception as e:
-            logger.warning(f"[群日报] 内容段发送失败: {e!s}")
-        if len(payloads) > 1:
-            await asyncio.sleep(1)
-
-
-async def _get_qq_bot() -> QqBot | None:
-    for b in get_bots().values():
-        if isinstance(b, QqBot):
-            return b
-    return None
 
 
 # ── 指令 ───────────────────────────────────────────────────────
@@ -112,96 +98,104 @@ async def _get_qq_bot() -> QqBot | None:
 _GROUP_LOCKS: dict[str, asyncio.Lock] = {}
 
 
-def _group_lock(group_openid: str) -> asyncio.Lock:
-    if group_openid not in _GROUP_LOCKS:
-        _GROUP_LOCKS[group_openid] = asyncio.Lock()
-    return _GROUP_LOCKS[group_openid]
+def _group_lock(key: str) -> asyncio.Lock:
+    if key not in _GROUP_LOCKS:
+        _GROUP_LOCKS[key] = asyncio.Lock()
+    return _GROUP_LOCKS[key]
 
 
 async def _is_group_message(event: Event) -> bool:
-    return isinstance(event, GroupMessageCreateEvent)
+    if GroupMessageCreateEvent is not None and isinstance(
+        event, GroupMessageCreateEvent
+    ):
+        return True
+    return Ob11GroupEvent is not None and isinstance(event, Ob11GroupEvent)
 
 
 daily_cmd = on_command("群日报", rule=Rule(_is_group_message), priority=5, block=True)
 
 
 @daily_cmd.handle()
-async def _(bot: QqBot, event: GroupMessageCreateEvent):
-    group_openid = event.group_openid
-    lock = _group_lock(group_openid)
+async def _(event: Event):
+    if isinstance(event, GroupMessageCreateEvent):
+        channel, group, msg_id = "qq", event.group_openid, event.id
+        bot = _find_qq_bot()
+    elif Ob11GroupEvent is not None and isinstance(event, Ob11GroupEvent):
+        channel, group, msg_id = "onebot", event.group_id, None
+        bot = _find_ob11_bot()
+    else:
+        return
+    if bot is None:
+        logger.warning("[群日报] 没有可用的 Bot 实例")
+        return
+
+    key = f"{channel}:{group}"
+    lock = _group_lock(key)
     if lock.locked():
-        await send_payloads(
-            bot,
-            group_openid,
-            [Payload(kind="text", content="本群已有日报任务在进行中，请稍候…")],
-            msg_id=event.id,
+        await deliver(
+            channel, bot, group,
+            Report(notices=["本群已有日报任务在进行中，请稍候…"], text=None, images=[]),
+            msg_id=msg_id,
         )
         return
 
     async with lock:
         try:
-            result = await generate_daily_report(
-                bot, group_openid, plugin_config, text_model, notify=True
+            report = await generate_daily_report(
+                bot, channel, group, plugin_config, text_model, notify=True
             )
         except RuntimeError as e:
-            logger.warning(f"[群日报] 群 {group_openid[:12]}… 生成失败: {e!s}")
-            await send_payloads(
-                bot,
-                group_openid,
-                [Payload(kind="text", content=f"群日报生成失败：{e!s}")],
-                msg_id=event.id,
+            logger.warning(f"[群日报] {key} 生成失败: {e!s}")
+            await deliver(
+                channel, bot, group,
+                Report(notices=[f"群日报生成失败：{e!s}"], text=None, images=[]),
+                msg_id=msg_id,
             )
             return
         except Exception:
             logger.exception("[群日报] 生成异常")
-            await send_payloads(
-                bot,
-                group_openid,
-                [Payload(kind="text", content="群日报生成失败，详见服务端日志。")],
-                msg_id=event.id,
+            await deliver(
+                channel, bot, group,
+                Report(notices=["群日报生成失败，详见服务端日志。"], text=None, images=[]),
+                msg_id=msg_id,
             )
             return
 
-    if not result.payloads:
+    if not (report.notices or report.text or report.images):
         return
-    await send_payloads(bot, group_openid, result.payloads, msg_id=event.id)
+    try:
+        await deliver(channel, bot, group, report, msg_id=msg_id)
+    except Exception:
+        logger.exception(f"[群日报] {key} 发送失败")
 
 
 # ── 定时推送 ───────────────────────────────────────────────────
 
 
-def _make_pusher(group_openids: list[str]):
-    """构造一次多群推送协程。"""
-
+def _make_pusher(channel: str, group: str | int):
     async def _push() -> None:
-        bot = await _get_qq_bot()
+        bot = _find_ob11_bot() if channel == "onebot" else _find_qq_bot()
         if bot is None:
-            logger.warning("[群日报] 定时推送时没有在线的官方 QQ 机器人")
+            logger.warning(f"[群日报] 定时推送时 {channel} 通道没有在线 Bot")
             return
-        for group_openid in group_openids:
-            lock = _group_lock(group_openid)
-            if lock.locked():
-                logger.info(f"[群日报] 群 {group_openid[:12]}… 任务进行中，跳过定时推送")
-                continue
-            async with lock:
-                try:
-                    result = await generate_daily_report(
-                        bot, group_openid, plugin_config, text_model, notify=False
-                    )
-                    payloads = [p for p in result.payloads if p]
-                except Exception:
-                    logger.exception(
-                        f"[群日报] 群 {group_openid[:12]}… 定时日报生成失败"
-                    )
-                    payloads = []
-            if payloads:
-                try:
-                    await send_payloads(bot, group_openid, payloads)
-                except Exception:
-                    logger.exception(
-                        f"[群日报] 群 {group_openid[:12]}… 定时日报发送失败"
-                    )
-            await asyncio.sleep(3)
+        key = f"{channel}:{group}"
+        lock = _group_lock(key)
+        if lock.locked():
+            logger.info(f"[群日报] {key} 任务进行中，跳过定时推送")
+            return
+        async with lock:
+            try:
+                report = await generate_daily_report(
+                    bot, channel, group, plugin_config, text_model, notify=False
+                )
+            except Exception:
+                logger.exception(f"[群日报] {key} 定时日报生成失败")
+                return
+        if report.notices or report.text or report.images:
+            try:
+                await deliver(channel, bot, group, report)
+            except Exception:
+                logger.exception(f"[群日报] {key} 定时日报发送失败")
 
     return _push
 
@@ -214,15 +208,24 @@ async def _register_jobs() -> None:
     for item in plugin_config.gdrq_group_schedules:
         if not item.enable:
             continue
+        if item.group_openid:
+            channel, group = "qq", item.group_openid
+        elif item.group_id is not None:
+            channel, group = "onebot", item.group_id
+        else:
+            logger.warning("[群日报] 定时配置缺少 group_openid / group_id，跳过")
+            continue
+
         parts = (item.time or "").strip().split(":")
         if len(parts) != 2:
-            logger.warning(f"[群日报] 无效时刻 {item.time!r}，跳过 {item.group_openid[:12]}…")
+            logger.warning(f"[群日报] 无效时刻 {item.time!r}，跳过 {channel}:{group}")
             continue
         try:
             hour, minute = int(parts[0]), int(parts[1])
         except ValueError:
-            logger.warning(f"[群日报] 无效时刻 {item.time!r}，跳过 {item.group_openid[:12]}…")
+            logger.warning(f"[群日报] 无效时刻 {item.time!r}，跳过 {channel}:{group}")
             continue
+
         job_kwargs: dict[str, Any] = {}
         note = ""
         if item.start_date.strip():
@@ -235,19 +238,20 @@ async def _register_jobs() -> None:
             except ValueError:
                 logger.warning(
                     f"[群日报] 无效 start_date {item.start_date!r}（应为 YYYY-MM-DD），"
-                    f"{item.group_openid[:12]}… 立即生效"
+                    f"{channel}:{group} 立即生效"
                 )
+
         scheduler.add_job(
-            _make_pusher([item.group_openid]),
+            _make_pusher(channel, group),
             "cron",
             hour=hour,
             minute=minute,
-            id=f"qq_daily_report_{item.group_openid}",
+            id=f"qq_daily_report_{channel}_{group}",
             replace_existing=True,
             misfire_grace_time=1800,
             **job_kwargs,
         )
-        scheduled.append(f"{item.group_openid[:12]}…@{item.time}{note}")
+        scheduled.append(f"{channel}:{group}@{item.time}{note}")
 
     scheduler.add_job(
         store.cleanup,

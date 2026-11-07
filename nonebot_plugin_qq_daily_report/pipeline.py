@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
-"""日报主流程编排：查库 → 统计 → LLM 分析 → 渲染海报 → 分片上传。
+"""日报主流程编排：按群所属适配器选择采集通道。
 
-与参考插件（bison5 OneBot 版）的差异：
+- OneBot 群：历史接口按时间回溯（可回补离线时段），接口拿不到时回落落库
+- 官方群：实时落库查询（无历史接口），空昵称走成员接口补全
 
-- 采集来自实时落库（官方机器人没有历史消息接口）；
-- 海报以 PNG 字节产出后走 ``sd_media`` 的分片上传通道换 raw_url，
-  再拼成 markdown 卡片；渲染/上传失败降级纯文字版；
-- 不再有漫画与敏感词链路。
+产物为通道无关的 :class:`~.send.Report`（notices / text / images），
+发送格式由 :mod:`.send` 按通道处理。
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -23,6 +21,7 @@ from .archive import ChatArchive, ChatMessage, resolve_window
 from .config import Config
 from .llm import TextModel, build_analysis_prompt
 from .render import build_text_summary, render_report_image, render_report_image_split
+from .send import Report
 from .stats import analyze, compress_nicknames, restore_nicknames
 
 API = "https://api.sgroup.qq.com"
@@ -34,28 +33,11 @@ _NICKNAME_LOOKUP_CAP = 30
 """单次报告最多补查多少个成员昵称（成员信息接口有频控）。"""
 
 
-@dataclass(slots=True)
-class Payload:
-    """一份待发送的内容段。"""
-
-    kind: str
-    """``markdown`` / ``text``。"""
-    content: str
-    notice: bool = False
-    """告警信息：不受 ``gdrq_send_text`` 开关影响，始终发送。"""
+# ── 群元信息（官方通道）────────────────────────────────────────
 
 
-@dataclass(slots=True)
-class ReportResult:
-    """一次日报生成的结果。"""
-
-    payloads: list[Payload] = field(default_factory=list)
-    stats: Any | None = None
-    archive: ChatArchive | None = None
-
-
-async def _fetch_group_meta(bot: Any, group_openid: str) -> tuple[int, str]:
-    """取群成员数与群名：落库缓存优先，过期才打 API。"""
+async def _fetch_group_meta_official(bot: Any, group_openid: str) -> tuple[int, str]:
+    """官方通道：群成员数与群名，落库缓存优先，过期才打 API。"""
     cached = await store.load_group_meta(group_openid, _META_CACHE_TTL)
     if cached:
         return int(cached["member_count"]), str(cached["group_name"])
@@ -76,9 +58,7 @@ async def _fetch_group_meta(bot: Any, group_openid: str) -> tuple[int, str]:
                 except (TypeError, ValueError):
                     member_count = 0
             else:
-                logger.warning(
-                    f"[群日报] 群信息接口 {r.status_code}: {r.text[:120]}"
-                )
+                logger.warning(f"[群日报] 群信息接口 {r.status_code}: {r.text[:120]}")
     except Exception as e:
         logger.warning(f"[群日报] 获取群信息失败: {e!s}")
 
@@ -89,12 +69,11 @@ async def _fetch_group_meta(bot: Any, group_openid: str) -> tuple[int, str]:
 async def _enrich_nicknames(
     bot: Any, group_openid: str, messages: list[ChatMessage]
 ) -> None:
-    """补全空昵称：成员缓存回填 → 成员信息接口逐个补查 → openid 尾号占位。"""
+    """官方通道补全空昵称：成员缓存回填 → 成员接口补查 → openid 尾号占位。"""
     missing = {m.member_openid for m in messages if not m.nickname}
     if not missing:
         return
 
-    # 1) 成员缓存回填（顺带把历史落库行的空昵称补掉）
     updated = await store.backfill_nicknames(group_openid)
     if updated:
         logger.info(f"[群日报] 用成员缓存回填了 {updated} 条消息的空昵称")
@@ -104,7 +83,6 @@ async def _enrich_nicknames(
                 m.nickname = cached[m.member_openid]
         missing = {m.member_openid for m in messages if not m.nickname}
 
-    # 2) 成员信息接口补查（有频控，逐个 try，限量）
     for openid in list(missing)[:_NICKNAME_LOOKUP_CAP]:
         try:
             info = await bot.get_group_member(
@@ -120,10 +98,60 @@ async def _enrich_nicknames(
             logger.debug(f"[群日报] 补查成员昵称失败 {openid[:16]}…: {e!s}")
             continue
 
-    # 3) 仍拿不到的用 openid 尾号占位，避免日报里出现空名
     for m in messages:
         if not m.nickname:
             m.nickname = f"用户{m.member_openid[-6:]}"
+
+
+# ── 采集 ───────────────────────────────────────────────────────
+
+
+async def _collect(
+    bot: Any, channel: str, group: str | int, start_ts: int, config: Config
+) -> ChatArchive:
+    """按通道采集：OneBot 历史回溯优先，官方查落库。"""
+    if channel == "onebot":
+        archive = None
+        try:
+            from .collect import fetch_group_archive
+
+            archive = await fetch_group_archive(
+                bot, int(group), since_ts=start_ts,
+                history_lens=20000,
+                page_size=5000,
+            )
+        except Exception as e:
+            logger.warning(f"[群日报] OneBot 历史接口采集失败，回落落库: {e!s}")
+        if archive and archive.messages:
+            return archive
+        # 接口失败/为空：实时落库兜底（ingest_ob11 写入的数据）
+        messages = await store.fetch_messages(
+            str(group), start_ts, int(time.time()), limit=50000, source="onebot"
+        )
+        fb = ChatArchive(
+            group_openid=str(group),
+            messages=messages,
+            fetched_at=int(time.time()),
+        )
+        if archive is not None:
+            fb.group_name, fb.member_count = archive.group_name, archive.member_count
+        return fb
+
+    # 官方通道
+    archive = ChatArchive(
+        group_openid=str(group), fetched_at=int(time.time())
+    )
+    archive.member_count, archive.group_name = await _fetch_group_meta_official(
+        bot, str(group)
+    )
+    archive.messages = await store.fetch_messages(
+        str(group), start_ts, int(time.time()), limit=50000, source="qq"
+    )
+    await _enrich_nicknames(bot, str(group), archive.messages)
+    return archive
+
+
+# ── 主流程 ─────────────────────────────────────────────────────
 
 
 def _restore_analysis(analysis: dict[str, Any], code_to_name: dict[str, str]) -> None:
@@ -168,28 +196,63 @@ def _restore_analysis(analysis: dict[str, Any], code_to_name: dict[str, str]) ->
                     d["comment"] = _fix(d.get("comment"))
 
 
-async def _render_and_upload(
+async def generate_daily_report(
     bot: Any,
-    group_openid: str,
-    archive: ChatArchive,
-    stats: Any,
-    analysis: dict[str, Any],
+    channel: str,
+    group: str | int,
     config: Config,
-) -> list[Payload]:
-    """渲染海报并分片上传，返回 markdown 载荷；失败返回空列表。"""
-    try:
-        from extra_plugins.sd_media import upload_bytes
-    except Exception as e:
-        logger.warning(f"[群日报] sd_media 不可用，跳过分片上传: {e!s}")
-        return []
+    text_model: TextModel,
+    *,
+    notify: bool = False,
+) -> Report:
+    """生成一份群日报（通道无关产物）。
 
-    token = await bot.get_access_token()
+    Args:
+        bot: 对应通道的 Bot 实例。
+        channel: ``"onebot"`` / ``"qq"``。
+        group: OneBot 群号（int）或官方群 openid（str）。
+        config: 插件配置。
+        text_model: 文字总结模型客户端。
+        notify: 数据不足等情况下是否生成提示消息（手动指令为 True，
+            定时推送为 False）。
+    """
+    start_ts, end_ts, window_label = resolve_window(config.gdrq_window)
+    archive = await _collect(bot, channel, group, start_ts, config)
+    archive.window_label = window_label
+    archive.filter_window(start_ts, end_ts)
 
-    async def _to_md(data: bytes, name: str) -> str | None:
-        url = await upload_bytes(token, data, name)
-        if not url:
-            return None
-        return f"![t {config.gdrq_img_size}]({url})"
+    notices: list[str] = []
+    if archive.messages:
+        first = archive.first_time or 0
+        if first > start_ts + 300:
+            archive.truncated = True
+            notices.append(
+                "⚠️ 机器人离线时段的消息无法回补，本报告仅覆盖 "
+                f"{archive.time_range_text.split(' ~ ')[0]} 之后的消息。"
+            )
+
+    min_count = config.gdrq_window_min_messages
+    if len(archive.messages) < min_count:
+        logger.info(
+            f"[群日报] {channel} 群 {group} 窗口内仅 {len(archive.messages)} 条"
+            f"（< {min_count}），跳过日报"
+        )
+        if notify:
+            notices.append(
+                f"本群 {window_label}消息不足（{len(archive.messages)} 条，"
+                f"至少需要 {min_count} 条），暂不生成日报。"
+            )
+        return Report(notices=notices, text=None, images=[])
+
+    stats = analyze(archive)
+    chat_lines, code_to_name = compress_nicknames(
+        archive.recent(config.gdrq_max_messages)
+    )
+    system, user = build_analysis_prompt(
+        stats, chat_lines, code_to_name, config, window_label
+    )
+    analysis = await text_model.complete_json(system, user)
+    _restore_analysis(analysis, code_to_name)
 
     images: list[bytes] = []
     if config.gdrq_split_report:
@@ -207,122 +270,12 @@ async def _render_and_upload(
         if single:
             images = [single]
 
-    payloads: list[Payload] = []
-    for i, data in enumerate(images, 1):
-        md = await _to_md(data, f"daily_report_{i}.png")
-        if not md:
-            logger.warning(f"[群日报] 第 {i} 张海报上传失败")
-            continue
-        if not payloads:
-            # 首图（长日报海报）在上，标题即卡片名；后续图（漫画等）依次排下
-            md = f"# 群日报\n\n{md}"
-        payloads.append(Payload(kind="markdown", content=md))
-    return payloads
-
-
-async def generate_daily_report(
-    bot: Any,
-    group_openid: str,
-    config: Config,
-    text_model: TextModel,
-    *,
-    notify: bool = False,
-) -> ReportResult:
-    """生成一份群日报。
-
-    Args:
-        bot: QQ 官方适配器的 Bot 实例。
-        group_openid: 群 openid。
-        config: 插件配置。
-        text_model: 文字总结模型客户端。
-        notify: 数据不足等情况下是否生成提示消息（手动指令为 True，
-            定时推送为 False——那个时间点没人在看）。
-
-    Returns:
-        :class:`ReportResult`。
-    """
-    start_ts, end_ts, window_label = resolve_window(config.gdrq_window)
-    archive = ChatArchive(
-        group_openid=group_openid,
-        fetched_at=int(time.time()),
-        window_label=window_label,
+    text = build_text_summary(analysis, stats, window_label)
+    if not images:
+        logger.warning("[群日报] 海报不可用，降级为纯文字版日报")
+    return Report(
+        notices=notices,
+        text=text,
+        images=images,
+        send_text=config.gdrq_send_text,
     )
-
-    archive.member_count, archive.group_name = await _fetch_group_meta(bot, group_openid)
-    archive.messages = await store.fetch_messages(
-        group_openid, start_ts, end_ts, limit=50000
-    )
-    await _enrich_nicknames(bot, group_openid, archive.messages)
-    dropped = archive.filter_window(start_ts, end_ts)
-    if dropped:
-        logger.debug(f"[群日报] 群 {group_openid[:12]}… 窗口外剔除 {dropped} 条")
-
-    result = ReportResult(archive=archive)
-
-    # 覆盖检查：最早一条消息没到窗口起点，说明机器人有离线时段
-    if archive.messages:
-        first = archive.first_time or 0
-        if first > start_ts + 300:
-            archive.truncated = True
-            result.payloads.append(
-                Payload(
-                    kind="text",
-                    content=(
-                        f"⚠️ 机器人离线时段的消息无法回补，本报告仅覆盖 "
-                        f"{archive.time_range_text.split(' ~ ')[0]} 之后的消息。"
-                    ),
-                    notice=True,
-                )
-            )
-
-    min_count = config.gdrq_window_min_messages
-    if len(archive.messages) < min_count:
-        logger.info(
-            f"[群日报] 群 {group_openid[:12]}… 窗口内仅 {len(archive.messages)} 条"
-            f"（< {min_count}），跳过日报"
-        )
-        if notify:
-            result.payloads.append(
-                Payload(
-                    kind="text",
-                    content=(
-                        f"本群 {window_label}消息不足（{len(archive.messages)} 条，"
-                        f"至少需要 {min_count} 条），暂不生成日报。"
-                    ),
-                    notice=True,
-                )
-            )
-        return result
-
-    stats = analyze(archive)
-    result.stats = stats
-
-    chat_lines, code_to_name = compress_nicknames(
-        archive.recent(config.gdrq_max_messages)
-    )
-    system, user = build_analysis_prompt(
-        stats, chat_lines, code_to_name, config, window_label
-    )
-    analysis = await text_model.complete_json(system, user)
-    _restore_analysis(analysis, code_to_name)
-
-    payloads = await _render_and_upload(
-        bot, group_openid, archive, stats, analysis, config
-    )
-    if payloads:
-        result.payloads.extend(payloads)
-        if config.gdrq_send_text:
-            result.payloads.append(
-                Payload(
-                    kind="text",
-                    content=build_text_summary(analysis, stats, window_label),
-                )
-            )
-        return result
-
-    # 海报渲染/上传失败：纯文字版兜底
-    logger.warning("[群日报] 海报不可用，降级为纯文字版日报")
-    result.payloads.append(
-        Payload(kind="text", content=build_text_summary(analysis, stats, window_label))
-    )
-    return result

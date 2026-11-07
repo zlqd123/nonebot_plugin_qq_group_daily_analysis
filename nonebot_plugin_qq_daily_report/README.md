@@ -1,10 +1,18 @@
 # nonebot_plugin_qq_daily_report
 
-QQ 官方机器人（adapter-qq）群聊日报：群内全量消息实时落库 → LLM 结构化分析 →
-scrapbook 主题海报 → sd_media 分片上传 → markdown 卡片发送。
+群聊日报插件（**二合一**：OneBot v11 / QQ 官方机器人，运行时自动检测通道）。
 
-移植自 bison5 的 `nonebot_plugin_qq_group_daily_analysis`（OneBot v11 版），
-采集层因官方平台限制重写，分析/渲染层沿用其提示词与 astrbot 模板。
+同一份代码部署在两类环境，按群所属适配器自动选择：
+
+| | OneBot v11 通道 | QQ 官方机器人通道 |
+| --- | --- | --- |
+| 群标识 | `group_id`（数字群号） | `group_openid` |
+| 采集 | `get_group_msg_history` 按时间回溯（**可回补离线时段**），实时消息同时落库兜底 | 全量群消息 WS 实时落库（官方无历史接口），离线时段丢失并在日报标注 |
+| 发送 | `send_group_msg` + base64 图片段 | 分片上传（内置实现，bison2 下优先复用 `sd_media`）→ markdown 卡片 |
+| 渲染 | 自动：htmlrender `template_to_pic`（0.7.x）→ 失败回落直连 chromium CDP（`SD_CDP_HOST/PORT`） | 同左 |
+
+移植自 OneBot 版 `nonebot_plugin_qq_group_daily_analysis`，砍掉漫画/敏感词链路；
+采集层两条路径、渲染层两条路径均已实测。
 
 ## 与 OneBot 版的关键差异
 
@@ -22,11 +30,11 @@ scrapbook 主题海报 → sd_media 分片上传 → markdown 卡片发送。
   `.env` 的 `QQ_BOTS` intent 需含 `"group_messages": true`
 - **图片**：复用 `extra_plugins/sd_media.py` 的分片上传通道（`SD_UPLOAD_GROUP`
   锚点群），raw_url 有效期 1 天，过期后历史海报会裂
-- **渲染**：直连 chromium 容器 CDP（`SD_CDP_HOST`/`SD_CDP_PORT` 环境变量，
-  与 `sd_render.py` 同款方式），**不走 htmlrender**（其 0.8.x rasterize 在
-  本环境实测 `Page.screenshot` 挂起）；chromium 的 `/start.sh` 已去掉
-  `--single-process --no-zygote`（该模式 CDP 建页即崩）；scrapbook 字体走
-  Google Fonts 公网，断网会回退系统字体
+- **渲染**：后端自动选择——htmlrender `template_to_pic`（0.7.x 可用时）
+  优先，失败/缺失回落直连 chromium 容器 CDP（`SD_CDP_HOST`/`SD_CDP_PORT`）。
+  所有资源走插件本地静态路由（启动预取 Google Fonts），渲染时零外网依赖。
+  注意：single-process 的 chromium 下**只能** `contexts[0].new_page()`，
+  详见 chromium 容器 README.md
 - **markdown**：自定义 markdown 全量开放（permission.type=2），无需模板资质
 
 ## 指令
