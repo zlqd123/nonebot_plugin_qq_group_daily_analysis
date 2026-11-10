@@ -363,12 +363,15 @@ gdr_image_size="2K"        # 自动映射到 imageConfig 的 1K/2K/4K
 ## 消息采集
 
 ```env
-gdr_source="auto"
+gdr_source="api"
 gdr_window="24h"
 ```
 
-- `gdr_source`：`chatrecorder` 读落库（零 API 调用）/ `api` 调历史接口 /
-  `auto` 优先读库、库空时回落 API
+- `gdr_source`：**`api` 优先（默认）**调 History 接口，昵称取
+  `sender.card`/`sender.nickname`、时间是真实时间戳、覆盖完整窗口；
+  `chatrecorder` 读落库（零 API 调用、无风控），但昵称要经 uninfo 的
+  `member_data`/`user_data` 反推（字段是 `nick` 不是 `card`/`nickname`），
+  且只覆盖机器人在线期间的消息，**仅作兜底**；`auto` = 先 api，api 没拿到才落库
 - `gdr_window`：`today` 今天 0 点至今 / `24h` 最近 24 小时 / `yesterday` 昨日全天 /
   `hours:N` 最近 N 小时
 
@@ -472,7 +475,7 @@ gdr_report_width=900
 
 | 变量 | 默认 | 说明 |
 | :--- | :--- | :--- |
-| `gdr_source` | `auto` | 消息来源 |
+| `gdr_source` | `api` | 消息来源（api 优先，chatrecorder 仅兜底） |
 | `gdr_window` | `today` | 覆盖范围 |
 | `gdr_history_lens` | `20000` | 条数安全上限，真正的终止条件是回溯够时间窗口 |
 | `gdr_fetch_page_size` | `5000` | 单次请求条数 |

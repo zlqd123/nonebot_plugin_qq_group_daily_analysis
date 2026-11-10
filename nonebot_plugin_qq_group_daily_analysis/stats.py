@@ -188,21 +188,27 @@ def compress_nicknames(messages: list[ChatMessage]) -> tuple[list[str], dict[str
     代号用**三位小写十六进制**而非十进制：三位十六进制可表示 4096 个用户，
     而三位十进制只有 1000 个，成员更多的群会溢出成四位、白白多占 token。
 
+    代号按 ``user_id`` 分配而不是按昵称：群里两个人重名（同名同头像很常见）
+    时，按昵称分配会把两个人的发言压成同一个代号，模型就会把两段对话
+    当成一个人在说。重名时两个代号各自独立，还原回来仍是同一个昵称，
+    信息不失真。
+
     Args:
         messages: 消息列表。
 
     Returns:
         ``(压缩后的文本行列表, 代号到昵称的映射)``。
     """
-    name_to_code: dict[str, str] = {}
+    uid_to_code: dict[int, str] = {}
     code_to_name: dict[str, str] = {}
     lines: list[str] = []
     for msg in messages:
-        if msg.nickname not in name_to_code:
-            code = f"{len(name_to_code):03x}"  # 十六进制：000~fff 共 4096 个
-            name_to_code[msg.nickname] = code
+        code = uid_to_code.get(msg.user_id)
+        if code is None:
+            code = f"{len(uid_to_code):03x}"  # 十六进制：000~fff 共 4096 个
+            uid_to_code[msg.user_id] = code
             code_to_name[code] = msg.nickname
-        lines.append(f"{name_to_code[msg.nickname]}: {msg.text}")
+        lines.append(f"{code}: {msg.text}")
     return lines, code_to_name
 
 

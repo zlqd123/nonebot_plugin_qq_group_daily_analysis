@@ -247,14 +247,14 @@ if sensitive.PACKAGED_LEXICON.exists():
     entries = sensitive.load_entries([sensitive.PACKAGED_LEXICON])
     if entries:
         has_lex = len(entries) > 1000
-        print(f"  {'✓' if has_lex else '✗'} 词库文件 词条数={len(entries)}（应 > 1000）")
+        print(f"  {'✓' if has_lex else '✗'} 打包词库 词条数={len(entries)}（应 > 1000）")
         ok = ok and has_lex
         _checker = sensitive.SensitiveChecker(entries)
         ok = _check_sensitive(_checker, entries) and ok
     else:
-        print("  - 词库文件存在但为空，静默跳过筛查检查")
+        print("  - 打包词库为空，静默跳过筛查检查")
 else:
-    print("  - 未找到词库文件（可选组件），静默跳过筛查检查")
+    print("  - 未找到打包词库（可选组件），静默跳过筛查检查")
 
 # 6. 图片段必须是 MessageSegment（Message.append 只认它，裸 dict 会抛
 #    ValueError: Unexpected type），且 .get 接口与字典混用时行为一致

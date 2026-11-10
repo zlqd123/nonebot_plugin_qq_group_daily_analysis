@@ -47,10 +47,13 @@ class Config(BaseModel, extra=Extra.ignore):
 
     # ── 采集 ──────────────────────────────────────────────
     gdr_source: Literal["auto", "chatrecorder", "api"] = Field(
-        default="auto",
+        default="api",
         description=(
-            "消息来源：chatrecorder=读 nonebot-plugin-chatrecorder 落库（零 API 调用，推荐）；"
-            "api=调 get_group_msg_history（有风控风险）；auto=优先读库、库空时回落 API"
+            "消息来源：**api 优先**（默认）=调 get_group_msg_history，昵称取 "
+            "sender.card/sender.nickname、时间是真实时间戳、覆盖完整窗口；"
+            "chatrecorder=读 nonebot-plugin-chatrecorder 落库（零 API 调用、无风控，"
+            "但昵称要经 uninfo 反推、只覆盖机器人在线期间，仅作兜底）；"
+            "auto=先 api，api 没拿到才回落落库"
         ),
     )
     gdr_history_lens: int = Field(

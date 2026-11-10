@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -136,6 +137,63 @@ def _sender_name(sender: dict) -> str:
         or sender.get("role")
         or str(sender.get("user_id", ""))
     )
+
+
+def _as_dict(value: Any) -> dict:
+    """把落库的 JSON 字段转成 dict。
+
+    兼容两种情况：ORM 的 JSON 列直接给 ``dict``，或原始 sqlite TEXT 给字符串。
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            loaded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+    return {}
+
+
+def _uninfo_display_name(member_data: Any, user_data: Any, user_id: Any) -> str:
+    """从 uninfo 落库的 ``member_data`` / ``user_data`` 里取展示名。
+
+    注意 uninfo 的字段名与 OneBot **完全不同**：
+
+    - ``member_data["nick"]``：群名片（对应 OneBot 的 ``sender.card``，可能为空串）
+    - ``member_data["user"]["nick"]`` / ``user_data["nick"]``：QQ 昵称
+    - 两者都没有 ``card`` / ``nickname`` 键
+
+    早期这里按 OneBot 的习惯取 ``member["card"] or user["nickname"]``，
+    在 uninfo 结构下两级全部落空，昵称退化成 ``str(user_id)``，
+    日报里的发言人于是全变成 QQ 号。这里按「群名片 → QQ 昵称 → QQ 号」
+    逐级兜底，同时保留旧字段兼容。
+
+    Args:
+        member_data: 会话的成员快照（uninfo ``Member`` 的 JSON）。
+        user_data: 用户资料（uninfo ``User`` 的 JSON）。
+        user_id: 兜底用的 QQ 号。
+
+    Returns:
+        展示名；全都取不到时返回 ``str(user_id)``。
+    """
+    member = _as_dict(member_data)
+    user = _as_dict(user_data)
+    nested = _as_dict(member.get("user"))
+
+    for value in (
+        member.get("card"),  # 兼容 OneBot 习惯的键
+        member.get("nick"),  # uninfo：群名片
+        nested.get("card"),
+        nested.get("nick"),  # 成员快照里的 QQ 昵称
+        user.get("card"),
+        user.get("nickname"),  # 旧字段兼容
+        user.get("nick"),
+        user.get("name"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return str(user_id)
 
 
 FORWARD_SEG_TYPES = frozenset({"forward", "json", "file"})
@@ -292,22 +350,26 @@ async def fetch_group_archive(
 ) -> ChatArchive:
     """采集群消息并清洗。
 
-    两种来源：
+    来源优先级：**API 优先，落库只做兜底**。
 
-    - ``chatrecorder``：读 nonebot-plugin-chatrecorder 的落库记录。
-      **不产生任何 OneBot API 调用**，没有风控风险，是推荐路径。
-      局限：只覆盖机器人在线期间收到的消息。
     - ``api``：调 OneBot v11 的 ``get_group_msg_history`` 分页回溯。
-      以「回溯到 ``since_ts``」为终止条件，因此覆盖的是**完整时间窗口**，
-      而不是「抓到 N 条为止」。
+      拿到的是 OneBot 原始消息，昵称直接取 ``sender.card`` / ``sender.nickname``，
+      时间戳是真实秒级 ``time``，且以「回溯到 ``since_ts``」为终止条件，
+      覆盖的是**完整时间窗口**。日报默认走这条。
+    - ``chatrecorder``：读 nonebot-plugin-chatrecorder 的落库记录。
+      零 API 调用、没有风控风险，但它是二手数据：昵称要经 uninfo 的
+      ``member_data`` / ``user_data`` 反推（字段是 ``nick``，不是 OneBot 的
+      ``card`` / ``nickname``，取错就把整篇日报写成 QQ 号），时间列还是
+      UTC naive 时间，且只覆盖机器人在线期间的消息。**仅作兜底**。
 
-    ``auto`` 会先试落库，库里没有数据再回落 API。
+    ``auto`` 因此也定义成「先 API，API 一条都没拿到才回落落库」，
+    与默认值保持一致，避免同一个词在不同版本里含义相反。
 
     Args:
         bot: OneBot v11 机器人实例。
         group_id: 群号。
         history_lens: 最多取多少条（安全上限，非终止条件）。
-        source: ``auto`` / ``chatrecorder`` / ``api``。
+        source: ``auto`` / ``api`` / ``chatrecorder``。
         page_size: api 模式单次请求条数。
         max_pages: api 模式最大翻页数。
         interval: api 模式翻页间隔（秒）。
@@ -327,13 +389,18 @@ async def fetch_group_archive(
     dropped: dict[int, str] = {}
     used = "api"
 
-    if source in ("auto", "chatrecorder"):
-        collected, dropped = await _collect_from_db(group_id, history_lens, self_id)
-        used = "chatrecorder"
-
-    if not collected and source in ("auto", "api"):
-        if used == "chatrecorder":
-            logger.info(f"[群日报] 群 {group_id} 落库无记录，回落到 API 拉取")
+    # ── 来源优先级：api 优先，chatrecorder 兜底 ──────────────────
+    # 日报固定优先走 OneBot API，原因有三：
+    #   1) 昵称：api 用 sender.card / sender.nickname，是原始字段；落库要经
+    #      uninfo 的 member_data / user_data 反推（那边字段是 nick），曾经因为
+    #      键名对不上，一整天的日报发言人全变成 QQ 号；
+    #   2) 时间：api 的 time 是真实秒级时间戳；落库那列是 UTC naive 时间，
+    #      还得自己补时区，跨天容易偏 8 小时；
+    #   3) 覆盖范围：api 以「回溯到 since_ts」为终止条件，能保证整个时间窗口
+    #      都被翻到；落库只覆盖机器人在线期间收到的消息。
+    # 只有在 api 一条都拿不到（接口报错、返回空）时才回落到落库，
+    # 保证日报不至于因为一次接口抖动直接空掉。
+    if source in ("api", "auto"):
         collected, archive.truncated, dropped = await _collect_from_api(
             bot,
             group_id,
@@ -345,6 +412,14 @@ async def fetch_group_archive(
             since_ts,
         )
         used = "api"
+
+    if not collected and source in ("auto", "chatrecorder"):
+        if source == "auto":
+            logger.warning(
+                f"[群日报] 群 {group_id} API 未取到消息，回落到 chatrecorder 落库"
+            )
+        collected, dropped = await _collect_from_db(group_id, history_lens, self_id)
+        used = "chatrecorder"
 
     archive.dropped_image_only = sum(1 for v in dropped.values() if v == "image")
     archive.dropped_forward_only = sum(1 for v in dropped.values() if v == "forward")
@@ -359,7 +434,30 @@ async def fetch_group_archive(
         f"[群日报] 群 {group_id} 采集到 {len(archive.messages)} 条消息"
         f"（目标 {history_lens}，来源 {used}），成员 {archive.member_count} 人"
     )
+    _warn_if_nickname_missing(group_id, archive)
     return archive
+
+
+def _warn_if_nickname_missing(group_id: int, archive: ChatArchive) -> None:
+    """昵称大面积退化成 QQ 号时给出告警。
+
+    昵称来自 uninfo 的落库快照；快照缺失（插件未启用、只落了 User 没落 Member
+    等）时会被兜底成 QQ 号。这种退化很难从日报成品上看出来是不是「本人就叫这个」，
+    所以在采集结束时主动暴露，避免又一次「日报里全是号」而日志一片安静。
+
+    Args:
+        group_id: 群号。
+        archive: 采集结果。
+    """
+    if not archive.messages:
+        return
+    degraded = sum(1 for m in archive.messages if m.nickname == str(m.user_id))
+    if degraded / len(archive.messages) <= 0.5:
+        return
+    logger.warning(
+        f"[群日报] 群 {group_id} 有 {degraded}/{len(archive.messages)} 条消息的昵称"
+        f"退化为 QQ 号，请检查 uninfo 的 member_data/user_data 是否有 nick 字段"
+    )
 
 
 def _chatrecorder_loaded() -> bool:
@@ -454,7 +552,7 @@ async def _collect_from_db(
 
         member = member_data if isinstance(member_data, dict) else {}
         user = user_data if isinstance(user_data, dict) else {}
-        nickname = member.get("card") or user.get("nickname") or str(user_id)
+        nickname = _uninfo_display_name(member, user, user_id)
         segments = raw_segments if isinstance(raw_segments, list) else []
         mid = int(message_id) if str(message_id).lstrip("-").isdigit() else 0
 

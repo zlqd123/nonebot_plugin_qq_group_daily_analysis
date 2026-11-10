@@ -2,10 +2,13 @@
 """插件配置，全部走 .env 的 ``GDRQ_`` 前缀。
 
 移植自 bison5 的 ``nonebot_plugin_qq_group_daily_analysis``（gdr_ 前缀），
-砍掉了历史消息翻页、漫画生图、敏感词防护等与官方机器人无关的配置。
+砍掉了历史消息翻页与敏感词防护等与官方机器人无关的配置；
+漫画生图（``GDRQ_IMAGE_*``）已移植回来。
 """
 
 from __future__ import annotations
+
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -81,11 +84,54 @@ class Config(BaseModel, extra="ignore"):
     """roast / warm / neutral / custom。"""
     gdrq_prompt_override: str = ""
 
+    # ── 生图模型（漫画）───────────────────────────────────
+    # 默认按火山方舟 Seedream 配（provider=doubao）。换服务商时改
+    # gdrq_image_provider 并调整 base_url / model / size。
+    gdrq_image_provider: Literal["doubao", "images", "google", "chat", "grok"] = "doubao"
+    """生图接口协议：doubao=火山方舟 Seedream / images=OpenAI 兼容
+    images/generations / google=Gemini / chat=OpenAI 兼容 chat/completions
+    多模态生图 / grok=x.ai。"""
+    gdrq_image_base_url: str = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+    """生图接口地址，写到 /v1 或完整 .../images/generations 都认。"""
+    gdrq_image_api_keys: list[str] = Field(default_factory=list)
+    """生图模型 API Key 列表（429 时自动轮换）。"""
+    gdrq_image_model: str = "doubao-seedream-5-0-flash-260915"
+    gdrq_image_proxy: str = ""
+    gdrq_image_timeout: int = 300
+    gdrq_image_size_mode: Literal["native", "upscale"] = "native"
+    """native=把 gdrq_image_size 原样发给接口（默认）；upscale=先按
+    gdrq_image_native_sizes 请求再本地放大（适合 OpenAI 等有原生上限的服务）。"""
+    gdrq_image_native_sizes: str = "1024x1024,1024x1536,1536x1024,1792x1024,1024x1792"
+    gdrq_image_size: str = "2048x2048"
+    """出图尺寸，原样透传给接口。默认 2048x2048（1:1）。
+    Seedream 也可用档位 1K / 1.5K / 2K。"""
+    gdrq_image_quality: str = ""
+    """OpenAI 独有质量档位 low/medium/high/auto，其他服务商留空。"""
+    gdrq_image_response_format: Literal["", "url", "b64_json"] = "b64_json"
+    gdrq_image_output_format: Literal["", "png", "jpeg"] = ""
+    gdrq_image_watermark: bool | None = None
+    """是否加水印（Seedream 支持），None=不发送该字段。"""
+    gdrq_image_extra: dict = Field(default_factory=dict)
+    """追加的原始请求字段，会覆盖上面同名字段，用于适配新参数。"""
+    gdrq_comic_prompt: str = ""
+    """漫画画面风格提示词（如「日式漫画风格，干净线稿」），追加在分镜规范后。"""
+    gdrq_image_aspect_ratio: str = "16:9"
+    """google / chat 协议使用；images/doubao 用 gdrq_image_size 控制比例。"""
+    gdrq_image_optimize_prompt: Literal["", "off", "fast", "standard"] = ""
+    """Seedream 服务端提示词优化：留空=服务端默认；off=显式关闭
+    （漫画内容跑偏时可尝试关闭）。"""
+    gdrq_image_retries: int = 1
+    """生图失败后的重试次数（网络/内容异常均计），0=不重试。"""
+    gdrq_image_retry_delay: float = 2.0
+
     # ── 定时推送 ────────────────────────────────────────────────
     gdrq_group_schedules: list[GroupSchedule] = Field(default_factory=list)
+    gdrq_enable_comic: bool = True
+    """定时推送日报时是否顺带生成漫画。只管定时；
+    「群日报漫画」「群日报整体」是手动指令，不受这个开关影响。"""
 
     # ── 落库 ────────────────────────────────────────────────────
-    gdrq_cache_dir: str = "/app/cache/qq_daily_report"
+    gdrq_cache_dir: str = "/app/extra_plugins/nonebot_plugin_qq_daily_report/cache"
     gdrq_retention_hours: int = 72
     """消息保留时长，超过即被清理任务删除。"""
     gdrq_cleanup_batch: int = 5000
