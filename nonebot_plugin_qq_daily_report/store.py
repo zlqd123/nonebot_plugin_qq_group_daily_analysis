@@ -2,7 +2,7 @@
 """聊天记录落库：SQLite，仅文本，保留时长由 ``gdrq_retention_hours`` 控制。
 
 官方机器人没有群历史消息接口，这里是唯一的数据来源——机器人在线期间
-通过 WS 推送收到的消息。库文件放在 ``/app/cache/qq_daily_report/``。
+通过 WS 推送收到的消息。库文件放在 ``/app/extra_plugins/nonebot_plugin_qq_daily_report/cache/``。
 """
 
 from __future__ import annotations

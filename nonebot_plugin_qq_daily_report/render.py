@@ -46,7 +46,7 @@ THEME_DIR = Path(__file__).parent / "templates" / "themes"
 
 #: 远程资源本地缓存目录（与落库同盘，宿主机可直接查看）。
 REMOTE_CACHE_DIR = Path(
-    os.environ.get("GDRQ_CACHE_DIR", "/app/cache/qq_daily_report")
+    os.environ.get("GDRQ_CACHE_DIR", "/app/extra_plugins/nonebot_plugin_qq_daily_report/cache")
 ) / "remote_cache"
 
 #: 模拟 Chrome UA：Google Fonts 只给现代 UA 返回 woff2。

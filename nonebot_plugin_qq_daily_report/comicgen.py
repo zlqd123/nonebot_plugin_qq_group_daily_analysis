@@ -4,7 +4,7 @@
 提示词与响应都无校验，且 url 形式的响应在已关闭的 httpx client 上下载
 必然失败。本模块按上游 ``DrawingClient`` 的经验重写，要点：
 
-- **多协议适配**（``gdr_image_provider``）：
+- **多协议适配**（``gdrq_image_provider``）：
 
   - ``doubao``  火山方舟 Seedream（默认，含 optimize_prompt 控制）；
   - ``images``  OpenAI 兼容 ``/images/generations``；
@@ -16,7 +16,7 @@
 - **图片提取**：递归收集 b64 / data URI / markdown 图链 / url 候选，
   按可靠性依次尝试，并对字节做图片签名校验（拒绝把 HTML/JSON 错误页
   当图片发群里）；url 下载与请求共用**同一个未关闭的** client。
-- **重试**：网络/内容异常按 ``gdr_image_retries`` 重试；429 自动轮换 Key。
+- **重试**：网络/内容异常按 ``gdrq_image_retries`` 重试；429 自动轮换 Key。
 - **敏感拦截**（``ImageAPIError``）：``400 InputTextSensitiveContentDetected``
   这类内容风控错误被单独归为 ``sensitive``——重试、换 Key 都不可能救回来，
   原样冒泡给调用方（:mod:`pipeline`）改写提示词或明确降级提示。
@@ -141,7 +141,7 @@ def parse_native_sizes(value: str) -> list[tuple[int, int]]:
     sizes = [s for s in (parse_size(v) for v in str(value or "").split(",")) if s]
     if not sizes:
         logger.warning(
-            f"[群日报] gdr_image_native_sizes {value!r} 解析不出任何合法尺寸，"
+            f"[群日报] gdrq_image_native_sizes {value!r} 解析不出任何合法尺寸，"
             f"回落到默认值"
         )
         return list(DEFAULT_NATIVE_SIZES)
@@ -511,12 +511,12 @@ class ComicImageModel:
     @property
     def available(self) -> bool:
         """是否配置了可用的 Key。"""
-        return bool(self._config.gdr_image_api_keys)
+        return bool(self._config.gdrq_image_api_keys)
 
     @property
     def provider(self) -> str:
         """当前协议名。"""
-        return self._config.gdr_image_provider
+        return self._config.gdrq_image_provider
 
     async def generate(self, prompt: str) -> bytes | None:
         """调用生图接口并返回图片字节。
@@ -532,22 +532,22 @@ class ComicImageModel:
         cfg = self._config
         self.last_error_kind = None
         self.last_error_text = None
-        if not cfg.gdr_image_api_keys:
-            logger.warning("[群日报] 未配置 gdr_image_api_keys，跳过漫画生成")
+        if not cfg.gdrq_image_api_keys:
+            logger.warning("[群日报] 未配置 gdrq_image_api_keys，跳过漫画生成")
             return None
 
-        retries = max(0, int(cfg.gdr_image_retries))
+        retries = max(0, int(cfg.gdrq_image_retries))
         last_error: Exception | None = None
         for attempt in range(retries + 1):
-            for key in cfg.gdr_image_api_keys:
+            for key in cfg.gdrq_image_api_keys:
                 try:
                     # 请求、提取、下载共用同一个 client，且都在 with 块内
                     # 完成——旧版把提取挪到块外，url 形式的响应必挂。
                     async with httpx.AsyncClient(
-                        proxy=cfg.gdr_image_proxy or None,
+                        proxy=cfg.gdrq_image_proxy or None,
                         timeout=httpx.Timeout(
                             connect=20.0,
-                            read=float(cfg.gdr_image_timeout),
+                            read=float(cfg.gdrq_image_timeout),
                             write=20.0,
                             pool=20.0,
                         ),
@@ -586,7 +586,7 @@ class ComicImageModel:
                     last_error = e
                     logger.error(f"[群日报] 生图调用异常: {e!s}")
             if attempt < retries:
-                delay = float(cfg.gdr_image_retry_delay)
+                delay = float(cfg.gdrq_image_retry_delay)
                 logger.info(
                     f"[群日报] 生图第 {attempt + 1} 次尝试失败，"
                     f"{delay:.0f}s 后重试（共 {retries + 1} 次）"
@@ -602,10 +602,10 @@ class ComicImageModel:
     def _want_and_native(self) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
         """解析期望尺寸与实际请求的原生尺寸（upscale 模式才做吸附）。"""
         cfg = self._config
-        want = parse_size(str(cfg.gdr_image_size or "").strip())
+        want = parse_size(str(cfg.gdrq_image_size or "").strip())
         native = want
-        if cfg.gdr_image_size_mode == "upscale" and want is not None:
-            native = snap_to_native(want, parse_native_sizes(cfg.gdr_image_native_sizes))
+        if cfg.gdrq_image_size_mode == "upscale" and want is not None:
+            native = snap_to_native(want, parse_native_sizes(cfg.gdrq_image_native_sizes))
             if native != want:
                 logger.info(
                     f"[群日报] 原生规格不支持 {want[0]}x{want[1]}，"
@@ -632,9 +632,9 @@ class ComicImageModel:
     def _size_payload(self) -> str:
         """images/doubao 协议的 size 字段值。"""
         cfg = self._config
-        raw = str(cfg.gdr_image_size or "").strip()
+        raw = str(cfg.gdrq_image_size or "").strip()
         _, native = self._want_and_native()
-        if cfg.gdr_image_size_mode == "upscale" and native is not None:
+        if cfg.gdrq_image_size_mode == "upscale" and native is not None:
             return f"{native[0]}x{native[1]}"
         return raw
 
@@ -697,35 +697,35 @@ class ComicImageModel:
         默认改写是漫画跑偏的嫌疑之一）。
         """
         cfg = self._config
-        url = build_target_url(cfg.gdr_image_base_url, "doubao")
+        url = build_target_url(cfg.gdrq_image_base_url, "doubao")
         headers = {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
         payload: dict[str, object] = {
-            "model": cfg.gdr_image_model,
+            "model": cfg.gdrq_image_model,
             "prompt": prompt,
         }
         size = self._size_payload()
         if size:
             payload["size"] = size
-        if cfg.gdr_image_response_format:
-            payload["response_format"] = cfg.gdr_image_response_format
-        if cfg.gdr_image_output_format:
-            payload["output_format"] = cfg.gdr_image_output_format
-        if cfg.gdr_image_watermark is not None:
-            payload["watermark"] = cfg.gdr_image_watermark
+        if cfg.gdrq_image_response_format:
+            payload["response_format"] = cfg.gdrq_image_response_format
+        if cfg.gdrq_image_output_format:
+            payload["output_format"] = cfg.gdrq_image_output_format
+        if cfg.gdrq_image_watermark is not None:
+            payload["watermark"] = cfg.gdrq_image_watermark
         # 提示词优化：off 显式关闭（改写是漫画内容跑偏的常见来源），
         # fast/standard 显式选择档位；留空交由服务端默认。
-        mode = str(cfg.gdr_image_optimize_prompt or "").strip().lower()
+        mode = str(cfg.gdrq_image_optimize_prompt or "").strip().lower()
         if mode == "off":
             payload["optimize_prompt"] = False
         elif mode in {"fast", "standard"}:
             payload["optimize_prompt_options"] = {"mode": mode}
-        payload.update(cfg.gdr_image_extra or {})
+        payload.update(cfg.gdrq_image_extra or {})
         logger.info(
             f"[群日报] 生图请求 [doubao] -> {url} "
-            f"(model={cfg.gdr_image_model}, size={size or '默认'}, "
+            f"(model={cfg.gdrq_image_model}, size={size or '默认'}, "
             f"optimize_prompt={mode or '服务端默认'})"
         )
         return await self._post_json(client, url, headers, payload)
@@ -735,30 +735,30 @@ class ComicImageModel:
     ) -> dict[str, Any]:
         """OpenAI 兼容 /images/generations（上游 images 预设精简版）。"""
         cfg = self._config
-        url = build_target_url(cfg.gdr_image_base_url, "images")
+        url = build_target_url(cfg.gdrq_image_base_url, "images")
         headers = {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
         payload: dict[str, object] = {
-            "model": cfg.gdr_image_model,
+            "model": cfg.gdrq_image_model,
             "prompt": prompt,
             "n": 1,
         }
         size = self._size_payload()
         if size:
             payload["size"] = size
-        quality = str(cfg.gdr_image_quality or "").strip().lower()
+        quality = str(cfg.gdrq_image_quality or "").strip().lower()
         if quality:
             payload["quality"] = quality
-        if cfg.gdr_image_response_format:
-            payload["response_format"] = cfg.gdr_image_response_format
-        if cfg.gdr_image_output_format:
-            payload["output_format"] = cfg.gdr_image_output_format
-        payload.update(cfg.gdr_image_extra or {})
+        if cfg.gdrq_image_response_format:
+            payload["response_format"] = cfg.gdrq_image_response_format
+        if cfg.gdrq_image_output_format:
+            payload["output_format"] = cfg.gdrq_image_output_format
+        payload.update(cfg.gdrq_image_extra or {})
         logger.info(
             f"[群日报] 生图请求 [images] -> {url} "
-            f"(model={cfg.gdr_image_model}, size={size or '默认'})"
+            f"(model={cfg.gdrq_image_model}, size={size or '默认'})"
         )
         return await self._post_json(client, url, headers, payload)
 
@@ -767,11 +767,11 @@ class ComicImageModel:
     ) -> dict[str, Any]:
         """Google Gemini generateContent 原生接口（上游 google 预设移植）。"""
         cfg = self._config
-        base = build_target_url(cfg.gdr_image_base_url, "google")
+        base = build_target_url(cfg.gdrq_image_base_url, "google")
         url = (
             base
             if ":generateContent" in base
-            else f"{base.rstrip('/')}/models/{cfg.gdr_image_model}:generateContent"
+            else f"{base.rstrip('/')}/models/{cfg.gdrq_image_model}:generateContent"
         )
         headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
         payload: dict[str, object] = {
@@ -779,17 +779,17 @@ class ComicImageModel:
             "generationConfig": {
                 "responseModalities": ["TEXT", "IMAGE"],
                 "imageConfig": {
-                    "image_size": _google_image_size(cfg.gdr_image_size),
-                    "aspect_ratio": str(cfg.gdr_image_aspect_ratio or "16:9"),
+                    "image_size": _google_image_size(cfg.gdrq_image_size),
+                    "aspect_ratio": str(cfg.gdrq_image_aspect_ratio or "16:9"),
                 },
             },
         }
-        payload.update(cfg.gdr_image_extra or {})
+        payload.update(cfg.gdrq_image_extra or {})
         logger.info(
             f"[群日报] 生图请求 [google] -> {url} "
-            f"(model={cfg.gdr_image_model}, "
-            f"size={_google_image_size(cfg.gdr_image_size)}, "
-            f"aspect_ratio={cfg.gdr_image_aspect_ratio})"
+            f"(model={cfg.gdrq_image_model}, "
+            f"size={_google_image_size(cfg.gdrq_image_size)}, "
+            f"aspect_ratio={cfg.gdrq_image_aspect_ratio})"
         )
         return await self._post_json(client, url, headers, payload)
 
@@ -801,7 +801,7 @@ class ComicImageModel:
         尺寸/横竖要求显式追加在提示词末尾，防止 chat 协议的模型忽略。
         """
         cfg = self._config
-        url = build_target_url(cfg.gdr_image_base_url, "chat")
+        url = build_target_url(cfg.gdrq_image_base_url, "chat")
         headers = {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
@@ -826,11 +826,11 @@ class ComicImageModel:
         else:
             full_prompt = prompt
         payload: dict[str, object] = {
-            "model": cfg.gdr_image_model,
+            "model": cfg.gdrq_image_model,
             "messages": [{"role": "user", "content": full_prompt}],
         }
-        payload.update(cfg.gdr_image_extra or {})
-        logger.info(f"[群日报] 生图请求 [chat] -> {url} (model={cfg.gdr_image_model})")
+        payload.update(cfg.gdrq_image_extra or {})
+        logger.info(f"[群日报] 生图请求 [chat] -> {url} (model={cfg.gdrq_image_model})")
         return await self._post_json(client, url, headers, payload)
 
     async def _request_grok(
@@ -838,23 +838,23 @@ class ComicImageModel:
     ) -> dict[str, Any]:
         """xAI Grok /images/generations（上游 grok/xai 预设精简版）。"""
         cfg = self._config
-        url = build_target_url(cfg.gdr_image_base_url, "grok")
+        url = build_target_url(cfg.gdrq_image_base_url, "grok")
         headers = {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
-        raw = str(cfg.gdr_image_size or "").strip()
+        raw = str(cfg.gdrq_image_size or "").strip()
         resolution = raw.lower() if raw.upper() in {"1K", "2K"} else "2k"
         payload: dict[str, object] = {
-            "model": cfg.gdr_image_model,
+            "model": cfg.gdrq_image_model,
             "prompt": prompt,
             "n": 1,
-            "response_format": cfg.gdr_image_response_format or "b64_json",
+            "response_format": cfg.gdrq_image_response_format or "b64_json",
             "resolution": resolution,
         }
-        payload.update(cfg.gdr_image_extra or {})
+        payload.update(cfg.gdrq_image_extra or {})
         logger.info(
             f"[群日报] 生图请求 [grok] -> {url} "
-            f"(model={cfg.gdr_image_model}, resolution={resolution})"
+            f"(model={cfg.gdrq_image_model}, resolution={resolution})"
         )
         return await self._post_json(client, url, headers, payload)

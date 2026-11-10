@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """QQ 官方机器人图片分片上传。
 
-优先复用宿主环境已有的 ``extra_plugins.sd_media``（bison2 部署，
+优先复用宿主环境已有的 ``extra_plugins.nonebot_plugin_bison_qqbot.sd_media``（bison2 部署，
 共享其 raw_url 缓存与锚点群配置）；不可用时用内置实现，行为一致：
 ``upload_prepare``（三哈希）→ 逐片 PUT → ``upload_part_finish`` →
 ``files`` 合并，拿 ``raw_url``（有效期 1 天）并按 md5 缓存。
@@ -24,9 +24,12 @@ AUTH = "https://bots.qq.com/app/getAppAccessToken"
 MAX_BYTES = 190 * 1024 * 1024
 
 _CACHE_FILE = pathlib.Path(
-    os.environ.get("GDRQ_CACHE_DIR", "/app/cache/qq_daily_report")
+    os.environ.get("GDRQ_CACHE_DIR", "/app/extra_plugins/nonebot_plugin_qq_daily_report/cache")
 ) / "upload_cache.json"
-_GROUPS_FILE = pathlib.Path("/app/qqbot_groups.json")
+def _groups_file() -> pathlib.Path:
+    """群册文件路径（懒加载：避免在插件装载期触发目标插件包的 __init__）。"""
+    from extra_plugins.nonebot_plugin_bison_qqbot.qqbot_paths import GROUPS_FILE
+    return GROUPS_FILE
 
 
 def _load_cache() -> dict:
@@ -50,7 +53,7 @@ def _anchor_group() -> str:
     if gid:
         return gid
     try:
-        groups = json.loads(_GROUPS_FILE.read_text(encoding="utf-8"))
+        groups = json.loads(_groups_file().read_text(encoding="utf-8"))
         if groups:
             return next(iter(groups))
     except Exception:
@@ -150,7 +153,7 @@ async def upload_bytes(token: str, data: bytes, name: str = "img.jpg") -> str:
         return ""
 
     try:  # bison2 部署：复用 sd_media（共享锚点群与素材缓存）
-        from extra_plugins.sd_media import upload_bytes as _sd_upload
+        from extra_plugins.nonebot_plugin_bison_qqbot.sd_media import upload_bytes as _sd_upload
 
         return await _sd_upload(token, data, name)
     except Exception:

@@ -12,6 +12,8 @@
 渲染通道自动选择：htmlrender 的 ``template_to_pic``（0.7.x，bison5 类
 环境）→ 失败回落直连 chromium CDP（bison2 环境，``SD_CDP_HOST/PORT``）。
 
+指令：/群日报（海报）、/群日报漫画（漫画）、/群日报整体（两样都出）。
+
 移植自 bison5 的 ``nonebot_plugin_qq_group_daily_analysis``（OneBot 版）。
 """
 
@@ -27,6 +29,7 @@ from nonebot.log import logger
 from nonebot.rule import Rule
 
 from . import store
+from .comicgen import ComicImageModel
 from .config import Config
 from .llm import TextModel
 from .pipeline import generate_daily_report
@@ -44,6 +47,8 @@ from nonebot.adapters.qq import GroupMessageCreateEvent  # noqa: E402
 
 plugin_config = get_plugin_config(Config)
 text_model = TextModel(plugin_config)
+# 漫画生图客户端（创建一次；未配 Key 时 available=False，自动跳过漫画）
+image_model = ComicImageModel(plugin_config)
 
 driver = get_driver()
 
@@ -113,10 +118,29 @@ async def _is_group_message(event: Event) -> bool:
 
 
 daily_cmd = on_command("群日报", rule=Rule(_is_group_message), priority=5, block=True)
+# 三条指令各自独立注册，不互为别名（互为别名会在同一条匹配里互相抢）
+comic_cmd = on_command("群日报漫画", rule=Rule(_is_group_message), priority=5, block=True)
+full_cmd = on_command("群日报整体", rule=Rule(_is_group_message), priority=5, block=True)
 
 
 @daily_cmd.handle()
-async def _(event: Event):
+async def _handle_daily(event: Event):
+    await _handle_report(event, with_comic=False, comic_only=False)
+
+
+@comic_cmd.handle()
+async def _handle_comic(event: Event):
+    await _handle_report(event, with_comic=True, comic_only=True)
+
+
+@full_cmd.handle()
+async def _handle_full(event: Event):
+    await _handle_report(event, with_comic=True, comic_only=False)
+
+
+async def _handle_report(
+    event: Event, *, with_comic: bool, comic_only: bool
+) -> None:
     if isinstance(event, GroupMessageCreateEvent):
         channel, group, msg_id = "qq", event.group_openid, event.id
         bot = _find_qq_bot()
@@ -142,7 +166,11 @@ async def _(event: Event):
     async with lock:
         try:
             report = await generate_daily_report(
-                bot, channel, group, plugin_config, text_model, notify=True
+                bot, channel, group, plugin_config, text_model,
+                image_model=image_model,
+                with_comic=with_comic,
+                comic_only=comic_only,
+                notify=True,
             )
         except RuntimeError as e:
             logger.warning(f"[群日报] {key} 生成失败: {e!s}")
@@ -186,7 +214,10 @@ def _make_pusher(channel: str, group: str | int):
         async with lock:
             try:
                 report = await generate_daily_report(
-                    bot, channel, group, plugin_config, text_model, notify=False
+                    bot, channel, group, plugin_config, text_model,
+                    image_model=image_model,
+                    with_comic=plugin_config.gdrq_enable_comic,
+                    notify=False,
                 )
             except Exception:
                 logger.exception(f"[群日报] {key} 定时日报生成失败")
